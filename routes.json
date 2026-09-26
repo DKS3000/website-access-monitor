@@ -1,0 +1,15 @@
+{
+  "routes": [
+    {
+      "name": "direct",
+      "type": "direct",
+      "description": "Direct connection"
+    },
+    {
+      "name": "vpn_route_1",
+      "type": "proxy",
+      "description": "Example VPN/proxy route",
+      "proxy_url": "http://127.0.0.1:8080"
+    }
+  ]
+}
