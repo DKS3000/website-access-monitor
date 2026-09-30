@@ -20,14 +20,42 @@ function escapeHtml(value) {
 function showError(error) { window.alert(error.message || String(error)); }
 function selectedTarget() { return document.querySelector("#historyTarget").value; }
 
+function updateClock() {
+  const el = document.querySelector("#clock");
+  if (el) el.textContent = new Date().toLocaleString();
+}
+updateClock();
+setInterval(updateClock, 1000);
+
+function renderGauges(agents, results) {
+  const el = document.querySelector("#agentGauges");
+  if (!el) return;
+  const enabled = agents.filter(a => a.enabled).slice(0, 4);
+  if (!enabled.length) { el.innerHTML = '<div class="gauge empty"><div class="g-label">Agents</div><div class="g-value">0</div><div class="g-sub">none enrolled</div></div>'; return; }
+  el.innerHTML = enabled.map(a => {
+    const own = results.filter(r => r.agent_name === a.name);
+    const total = own.length;
+    const ok = own.filter(r => r.classification === "reachable").length;
+    const pct = total ? Math.round((ok / total) * 100) : null;
+    const staleClass = pct === null ? "empty" : pct < 100 ? "stale" : "";
+    return `<div class="gauge ${staleClass}"><div class="g-label">${escapeHtml(a.name)}</div>
+      <div class="g-value">${pct === null ? "—" : `${pct}%`}</div>
+      <div class="g-sub">${escapeHtml(a.country_code || "")} · ${ok}/${total} reachable</div></div>`;
+  }).join("");
+}
+
+let lastAgents = [];
+
 async function refresh() {
   try {
     const [targets, agents, jobs, countries] = await Promise.all([
       api("/api/targets"), api("/api/agents"), api("/api/jobs"), api("/api/countries")
     ]);
+    lastAgents = agents;
     renderTargets(targets);
     renderAgents(agents);
     renderJobs(jobs);
+    if (!selectedTarget()) renderGauges(agents, []);
     if (!document.querySelector("#agentCountry").options.length) {
       document.querySelector("#agentCountry").innerHTML = countries.map(c => `<option value="${escapeHtml(c.code)}">${escapeHtml(c.name)} (${escapeHtml(c.code)})</option>`).join("");
     }
@@ -125,7 +153,7 @@ function renderChart(results) {
 async function refreshResults() {
   const results = await api(`/api/results?target_id=${encodeURIComponent(selectedTarget())}&limit=200`);
   const tbody = document.querySelector("#results");
-  tbody.innerHTML = results.map(r => `<tr>
+  tbody.innerHTML = results.map(r => `<tr data-classification="${escapeHtml(r.classification)}">
     <td>${escapeHtml(new Date(r.timestamp).toLocaleString())}</td>
     <td>${escapeHtml(r.country || "Unknown")} · ${escapeHtml(r.agent_name || "Agent")}</td>
     <td>${r.http_status ?? "—"}</td><td>${r.response_time_ms == null ? "—" : `${escapeHtml(r.response_time_ms)} ms`}</td>
@@ -167,6 +195,11 @@ async function refreshResults() {
     <td>${stats.latency.length ? `${Math.round(stats.latency.reduce((a, b) => a + b, 0) / stats.latency.length)} ms` : "—"}</td>
     <td>${stats.denied}</td><td>${stats.redirects}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">No route history yet.</td></tr>';
   renderChart(results);
+  renderGauges(lastAgents, results);
+  document.querySelector("#counters").innerHTML = `
+    <div class="counter c-blue">Checked<strong>${results.length}</strong></div>
+    <div class="counter c-green">Reachable<strong>${counts.reachable}</strong></div>
+    <div class="counter c-red">Denied / failed<strong>${counts.denied + counts.failures}</strong></div>`;
   tbody.querySelectorAll('[data-action="details"]').forEach(button => button.addEventListener("click", () => {
     const item = results.find(r => String(r.id) === button.dataset.id);
     document.querySelector("#detailBody").textContent = JSON.stringify(item, null, 2);

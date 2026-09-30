@@ -8,59 +8,72 @@
 </head>
 <body>
   <header class="top">
-    <div><span class="eyebrow">PUBLIC REACHABILITY</span><h1>Website Access Monitor</h1></div>
-    <label class="token">Dashboard API token <input id="dashboardToken" type="password" placeholder="Optional for local-only use"></label>
+    <div class="brand"><span class="eyebrow">PUBLIC REACHABILITY MONITOR</span><h1>Website Access Monitor</h1>
+      <p class="tagline">Multi-agent, multi-country HTTP(S) reachability checks — a 403 is recorded, never bypassed.</p></div>
+    <div id="agentGauges" class="gauges"></div>
+    <div class="top-right">
+      <label class="token">Dashboard API token <input id="dashboardToken" type="password" placeholder="Optional for local-only use"></label>
+      <div id="clock" class="clock"></div>
+    </div>
   </header>
-  <main>
-    <section class="panel">
-      <h2>Targets</h2>
-      <form id="targetForm" class="form-row">
-        <input id="targetName" placeholder="Label (optional)" maxlength="100">
-        <input id="targetUrl" type="url" placeholder="https://example.com/public-page" required>
-        <button>Add target</button>
-      </form>
-      <div id="targets" class="target-list"></div>
-    </section>
-    <section class="panel">
-      <h2>VPS / route agents</h2>
-      <form id="agentForm" class="form-row">
-        <input id="agentName" placeholder="Agent name, e.g. Mumbai VPS" required>
-        <select id="agentCountry" required></select>
-        <select id="agentRoute"><option value="direct">Direct from VPS</option><option value="proxy">Configured HTTP proxy</option></select>
-        <input id="agentProxy" placeholder="Proxy URL (proxy routes only)">
-        <input id="agentIp" placeholder="Known public egress IP (optional)">
-        <button>Enroll agent</button>
-      </form>
-      <p class="muted">Enrollment token is shown once. Run the agent on its VPS with that token and the displayed agent ID.</p>
-      <div id="enrollment" class="notice hidden"></div>
-      <div id="agents" class="agent-list"></div>
-    </section>
-    <section class="panel">
-      <h2>Run sequential checks</h2>
-      <form id="jobForm">
-        <div class="form-row">
-          <select id="jobTarget" required></select>
-          <input id="timeout" type="number" min="1" max="120" value="20" aria-label="Timeout seconds">
-          <select id="schedule">
-            <option value="once">Run once</option><option value="300">Every 5 minutes</option>
-            <option value="900">Every 15 minutes</option><option value="1800">Every 30 minutes</option>
-            <option value="3600">Hourly</option><option value="86400">Daily</option>
-          </select>
-          <button>Run checks</button>
+  <main class="grid-main">
+    <div class="col-left">
+      <section class="panel">
+        <h2>Step 1 · Targets</h2>
+        <form id="targetForm" class="form-row">
+          <input id="targetName" placeholder="Label (optional)" maxlength="100">
+          <input id="targetUrl" type="url" placeholder="https://example.com/public-page" required>
+          <button>Add target</button>
+        </form>
+        <div id="targets" class="target-list"></div>
+      </section>
+      <section class="panel">
+        <h2>Step 2 · VPS / route agents</h2>
+        <form id="agentForm" class="form-row">
+          <input id="agentName" placeholder="Agent name, e.g. Mumbai VPS" required>
+          <select id="agentCountry" required></select>
+          <select id="agentRoute"><option value="direct">Direct from VPS</option><option value="proxy">Configured HTTP proxy</option></select>
+          <input id="agentProxy" placeholder="Proxy URL (proxy routes only)">
+          <input id="agentIp" placeholder="Known public egress IP (optional)">
+          <button>Enroll agent</button>
+        </form>
+        <p class="muted">Enrollment token is shown once. Run the agent on its VPS with that token and the displayed agent ID.</p>
+        <div id="enrollment" class="notice hidden"></div>
+        <div id="agents" class="agent-list"></div>
+        <div id="counters" class="counters"></div>
+      </section>
+      <section class="panel">
+        <h2>Step 3 · Run sequential checks</h2>
+        <form id="jobForm">
+          <div class="form-row">
+            <select id="jobTarget" required></select>
+            <input id="timeout" type="number" min="1" max="120" value="20" aria-label="Timeout seconds">
+            <select id="schedule">
+              <option value="once">Run once</option><option value="300">Every 5 minutes</option>
+              <option value="900">Every 15 minutes</option><option value="1800">Every 30 minutes</option>
+              <option value="3600">Hourly</option><option value="86400">Daily</option>
+            </select>
+            <button>Run checks</button>
+          </div>
+          <fieldset><legend>Selected agents — probe one at a time in this order</legend><div id="agentChoices" class="choices"></div></fieldset>
+        </form>
+        <div id="jobs" class="jobs"></div>
+      </section>
+    </div>
+    <div class="col-right">
+      <section class="panel">
+        <div class="section-title"><div><h2>Route results <span class="hint">(recorded observations — click a row for diagnostics)</span></h2></div>
+          <select id="historyTarget" aria-label="Target history"></select>
         </div>
-        <fieldset><legend>Selected agents — probe one at a time in this order</legend><div id="agentChoices" class="choices"></div></fieldset>
-      </form>
-      <div id="jobs" class="jobs"></div>
-    </section>
-    <section class="panel">
-      <div class="section-title"><div><h2>Route comparison & history</h2><p class="muted">403 responses are recorded as route-specific access results; no bypass is attempted.</p></div>
-        <select id="historyTarget" aria-label="Target history"></select>
-      </div>
-      <div id="summary" class="summary"></div>
-      <div class="table-wrap"><table><thead><tr><th>Country / agent</th><th>Availability</th><th>Avg latency</th><th>HTTP 403</th><th>Redirects</th></tr></thead><tbody id="routeComparison"></tbody></table></div>
-      <canvas id="latencyChart" height="180" aria-label="Latency history chart"></canvas>
-      <div class="table-wrap"><table><thead><tr><th>Time</th><th>Country / route</th><th>HTTP</th><th>Latency</th><th>Result</th><th>Redirects</th><th></th></tr></thead><tbody id="results"></tbody></table></div>
-    </section>
+        <div id="summary" class="summary"></div>
+        <div class="table-wrap"><table><thead><tr><th>Country / agent</th><th>Availability</th><th>Avg latency</th><th>HTTP 403</th><th>Redirects</th></tr></thead><tbody id="routeComparison"></tbody></table></div>
+        <canvas id="latencyChart" height="180" aria-label="Latency history chart"></canvas>
+      </section>
+      <section class="panel scan-log">
+        <h2>Scan log <span class="hint">(most recent probes)</span></h2>
+        <div class="table-wrap"><table><thead><tr><th>Time</th><th>Country / route</th><th>HTTP</th><th>Latency</th><th>Result</th><th>Redirects</th><th></th></tr></thead><tbody id="results"></tbody></table></div>
+      </section>
+    </div>
   </main>
   <dialog id="details"><button class="close" id="closeDetails">Close</button><h2>Probe diagnostics</h2><pre id="detailBody"></pre></dialog>
   <script src="/static/dashboard.js" defer></script>
