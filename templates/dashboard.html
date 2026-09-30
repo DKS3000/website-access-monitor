@@ -44,7 +44,6 @@
           </select>
           <input id="agentIp" placeholder="Known public egress IP (optional)">
           <button id="agentSubmit">Enroll agent</button>
-          <button type="button" id="agentCancelEdit" class="hidden">Cancel edit</button>
         </form>
         <p class="muted">Enrollment token is shown once. Run the agent on its VPS with that token and the displayed agent ID.</p>
         <p class="muted">For a VPN route, install and log in to the chosen client on the agent's host first (e.g. <code>nordvpn login</code> or <code>mullvad account login</code>); the agent only switches that client's server to the country selected above — it never tries other countries or servers to get past a 403. Changing which country an agent monitors is just editing the agent below and picking a new country; no re-enrollment needed.</p>
