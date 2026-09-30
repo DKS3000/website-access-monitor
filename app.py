@@ -3,13 +3,14 @@
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from functools import wraps
+from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, render_template, request
 
@@ -29,6 +30,7 @@ def create_app(test_config=None):
         ),
         DASHBOARD_TOKEN=os.environ.get("DASHBOARD_TOKEN", ""),
         START_SCHEDULER=True,
+        MAX_CONTENT_LENGTH=64 * 1024,
     )
     if test_config:
         app.config.update(test_config)
@@ -144,10 +146,28 @@ def create_app(test_config=None):
         if not name or route_type not in {"direct", "proxy"}:
             return jsonify({"error": "Agent name and a direct/proxy route type are required."}), 400
         if route_type == "proxy":
-            if not isinstance(proxy_url, str) or not proxy_url.startswith(("http://", "https://")):
+            try:
+                parsed_proxy = urlsplit(proxy_url)
+                valid_proxy = (
+                    parsed_proxy.scheme in {"http", "https"}
+                    and parsed_proxy.hostname
+                    and parsed_proxy.port != 0
+                    and not parsed_proxy.username
+                    and not parsed_proxy.password
+                )
+            except (TypeError, ValueError):
+                valid_proxy = False
+            if not valid_proxy:
                 return jsonify({"error": "Proxy routes require an HTTP or HTTPS proxy URL."}), 400
             if "@" in proxy_url.split("://", 1)[-1]:
                 return jsonify({"error": "Credentials in proxy URLs are not supported; configure a trusted proxy without embedded credentials."}), 400
+        public_ip = str(data.get("public_ip", "")).strip()
+        if public_ip:
+            try:
+                if not ipaddress.ip_address(public_ip).is_global:
+                    raise ValueError("not public")
+            except ValueError:
+                return jsonify({"error": "Public egress IP must be a valid public IP address."}), 400
         with db.connect() as connection:
             if not connection.execute("SELECT 1 FROM countries WHERE code=?", (country,)).fetchone():
                 return jsonify({"error": "Select a supported country."}), 400
@@ -156,7 +176,7 @@ def create_app(test_config=None):
                 """INSERT INTO agents(name,country_code,token_hash,public_ip,route_type,proxy_url,created_at)
                    VALUES(?,?,?,?,?,?,?)""",
                 (name, country, hashlib.sha256(token.encode()).hexdigest(),
-                 str(data.get("public_ip", "")).strip()[:64] or None,
+                 public_ip[:64] or None,
                  route_type, proxy_url if route_type == "proxy" else None, utcnow()),
             )
             agent_id = cursor.lastrowid
@@ -347,12 +367,19 @@ def create_app(test_config=None):
     @app.post("/api/agent/<int:agent_id>/heartbeat")
     def agent_heartbeat(agent_id):
         data = request.get_json(silent=True) or {}
+        public_ip = str(data.get("public_ip", "")).strip()
+        if public_ip:
+            try:
+                if not ipaddress.ip_address(public_ip).is_global:
+                    raise ValueError("not public")
+            except ValueError:
+                return jsonify({"error": "Public egress IP must be a valid public IP address."}), 400
         with db.connect() as connection:
             if not agent_authorized(connection, agent_id):
                 return jsonify({"error": "Agent authentication failed."}), 401
             connection.execute(
                 "UPDATE agents SET status='online',last_heartbeat=?,public_ip=COALESCE(?,public_ip) WHERE id=?",
-                (utcnow(), str(data.get("public_ip", "")).strip()[:64] or None, agent_id),
+                (utcnow(), public_ip[:64] or None, agent_id),
             )
         return jsonify({"status": "online"})
 
@@ -430,7 +457,7 @@ def create_app(test_config=None):
             if isinstance(headers, dict):
                 connection.executemany(
                     "INSERT INTO response_headers(result_id,name,value) VALUES(?,?,?)",
-                    [(str(k)[:100], str(v)[:2000]) for k, v in headers.items()],
+                    [(result_id, str(k)[:100], str(v)[:2000]) for k, v in headers.items()],
                 )
             connection.execute(
                 "UPDATE agent_tasks SET status='completed',finished_at=? WHERE id=?",

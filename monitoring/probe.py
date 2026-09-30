@@ -84,6 +84,62 @@ def _tls_info(response):
         return None
 
 
+def _request_chain(url, timeout, proxy_url):
+    redirects = []
+    current_url = url
+    for _ in range(11):
+        current_url = validate_public_url(current_url)
+        with requests.Session() as session:
+            session.trust_env = False
+            with session.get(
+                current_url,
+                timeout=timeout,
+                allow_redirects=False,
+                stream=True,
+                verify=True,
+                proxies={"http": proxy_url, "https": proxy_url} if proxy_url else {},
+                headers={"User-Agent": "WebsiteAccessMonitor/1.0 (+public reachability diagnostics)"},
+            ) as response:
+                location = response.headers.get("Location")
+                if response.status_code in {301, 302, 303, 307, 308} and location:
+                    redirects.append(
+                        {"url": current_url, "status": response.status_code, "location": location}
+                    )
+                    current_url = urljoin(current_url, location)
+                    continue
+                body_size = 0
+                for chunk in response.iter_content(64 * 1024):
+                    body_size += min(len(chunk), MAX_RESPONSE_BYTES - body_size)
+                    if body_size >= MAX_RESPONSE_BYTES:
+                        break
+                status_code = response.status_code
+                classification = (
+                    "access_denied" if status_code == 403
+                    else "reachable" if 200 <= status_code < 400
+                    else "http_error"
+                )
+                return {
+                    "http_status": status_code,
+                    "status": "success" if classification == "reachable" else "error",
+                    "classification": classification,
+                    "final_url": current_url,
+                    "tls": _tls_info(response) if urlsplit(current_url).scheme == "https" else None,
+                    "redirects": redirects,
+                    "redirect_count": len(redirects),
+                    "headers": {
+                        key: value for key, value in response.headers.items()
+                        if key.lower() in RECORDED_HEADERS
+                    },
+                    "response_size": body_size,
+                }
+    return {
+        "classification": "http_error",
+        "error": "Too many redirects.",
+        "redirects": redirects,
+        "redirect_count": len(redirects),
+    }
+
+
 def probe_url(url, timeout=20, retries=0, proxy_url=None):
     """Request the supplied public URL once per attempt, recording route evidence."""
     url = validate_public_url(url)
@@ -112,50 +168,10 @@ def probe_url(url, timeout=20, retries=0, proxy_url=None):
     for attempt in range(max(0, min(int(retries), 5)) + 1):
         started = time.perf_counter()
         try:
-            current_url = url
-            redirects = []
-            for _ in range(11):
-                current_url = validate_public_url(current_url)
-                with requests.get(
-                    current_url,
-                    timeout=max(1, min(int(timeout), 120)),
-                    allow_redirects=False,
-                    stream=True,
-                    verify=True,
-                    proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
-                    headers={"User-Agent": "WebsiteAccessMonitor/1.0 (+public reachability diagnostics)"},
-                ) as response:
-                    location = response.headers.get("Location")
-                    if response.status_code in {301, 302, 303, 307, 308} and location:
-                        redirects.append(
-                            {"url": current_url, "status": response.status_code, "location": location}
-                        )
-                        current_url = urljoin(current_url, location)
-                        continue
-                    result["response_time_ms"] = round((time.perf_counter() - started) * 1000, 2)
-                    result["http_status"] = response.status_code
-                    result["final_url"] = current_url
-                    result["tls"] = _tls_info(response) if urlsplit(current_url).scheme == "https" else None
-                    result["redirects"] = redirects
-                    result["redirect_count"] = len(redirects)
-                    result["headers"] = {
-                        key: value for key, value in response.headers.items()
-                        if key.lower() in RECORDED_HEADERS
-                    }
-                    body = bytearray()
-                    for chunk in response.iter_content(64 * 1024):
-                        body.extend(chunk)
-                        if len(body) >= MAX_RESPONSE_BYTES:
-                            break
-                    result["response_size"] = len(body)
-                    if response.status_code == 403:
-                        result.update(status="error", classification="access_denied")
-                    elif 200 <= response.status_code < 400:
-                        result.update(status="success", classification="reachable")
-                    else:
-                        result.update(status="error", classification="http_error")
-                    return result
-            result.update(classification="http_error", error="Too many redirects.")
+            result.update(_request_chain(
+                url, max(1, min(int(timeout), 120)), proxy_url
+            ))
+            result["response_time_ms"] = round((time.perf_counter() - started) * 1000, 2)
             return result
         except URLValidationError as exc:
             result.update(classification="unsafe_redirect", error=str(exc))

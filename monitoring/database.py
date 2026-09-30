@@ -67,6 +67,14 @@ CREATE INDEX IF NOT EXISTS idx_tasks_agent_status ON agent_tasks(agent_id, statu
 """
 
 
+class ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 class Database:
     def __init__(self, path=None):
         self.path = path or os.environ.get(
@@ -77,7 +85,7 @@ class Database:
         self.initialize()
 
     def connect(self):
-        connection = sqlite3.connect(self.path, timeout=30)
+        connection = sqlite3.connect(self.path, timeout=30, factory=ClosingConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         if self.path != ":memory:":
