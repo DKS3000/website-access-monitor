@@ -208,6 +208,8 @@ def create_app(test_config=None):
                 (utcnow(), job_id),
             )
             return False
+        if job["status"] == "running":
+            return False
         sequence = connection.execute(
             "SELECT COALESCE(MAX(sequence),0)+1 FROM agent_tasks WHERE job_id=?", (job_id,)
         ).fetchone()[0]
@@ -272,7 +274,7 @@ def create_app(test_config=None):
             if not result.rowcount:
                 return jsonify({"error": "Job is not active."}), 409
             connection.execute(
-                "UPDATE agent_tasks SET status='cancelled',finished_at=? WHERE job_id=? AND status='queued'",
+                "UPDATE agent_tasks SET status='cancelled',finished_at=? WHERE job_id=? AND status IN ('queued','running')",
                 (utcnow(), job_id),
             )
         return jsonify({"status": "paused"})
@@ -284,6 +286,7 @@ def create_app(test_config=None):
             if not row or not row["paused"]:
                 return jsonify({"error": "Job is not paused."}), 409
             connection.execute("UPDATE probe_jobs SET paused=0 WHERE id=?", (job_id,))
+            connection.execute("UPDATE probe_jobs SET status='scheduled' WHERE id=?", (job_id,))
             begin_job(connection, job_id)
         return jsonify({"status": "running"})
 
@@ -293,7 +296,8 @@ def create_app(test_config=None):
             row = connection.execute("SELECT * FROM probe_jobs WHERE id=?", (job_id,)).fetchone()
             if not row:
                 return jsonify({"error": "Job not found."}), 404
-            begin_job(connection, job_id)
+            if not begin_job(connection, job_id):
+                return jsonify({"error": "Job is already running or cannot be retried."}), 409
         return jsonify({"status": "running"})
 
     @app.get("/api/results")
@@ -397,7 +401,7 @@ def create_app(test_config=None):
             classification = str(data.get("classification", "network_error"))
             if classification not in {
                 "reachable", "access_denied", "http_error", "dns_error",
-                "tls_error", "timeout", "network_error",
+                "tls_error", "timeout", "network_error", "unsafe_redirect",
             }:
                 classification = "network_error"
             status = "success" if classification == "reachable" else "error"
@@ -455,7 +459,11 @@ def create_app(test_config=None):
                     "UPDATE probe_jobs SET current_index=? WHERE id=?", (next_index, job["id"])
                 )
             else:
-                run_status = "scheduled" if job["schedule_interval"] and not job["paused"] else "completed"
+                run_status = (
+                    "paused" if job["paused"]
+                    else "scheduled" if job["schedule_interval"]
+                    else "completed"
+                )
                 next_run = (
                     (datetime.now(timezone.utc) + timedelta(seconds=job["schedule_interval"])).isoformat()
                     if run_status == "scheduled" else None
@@ -483,13 +491,16 @@ def create_app(test_config=None):
                         begin_job(connection, row["id"])
                     stale = connection.execute(
                         """SELECT q.*,j.target_id,j.agent_ids,j.current_index,j.schedule_interval,j.paused,
+                                  j.timeout,j.retries,
                                   a.country_code,a.name AS agent_name,a.public_ip,t.url
                            FROM agent_tasks q JOIN probe_jobs j ON j.id=q.job_id
                            JOIN agents a ON a.id=q.agent_id JOIN targets t ON t.id=j.target_id
-                           WHERE q.status='running' AND q.started_at<?""",
-                        ((datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat(),),
+                           WHERE q.status='running'""",
                     ).fetchall()
                     for task in stale:
+                        task_timeout = task["timeout"] * (task["retries"] + 1) + 60
+                        if datetime.now(timezone.utc) - datetime.fromisoformat(task["started_at"]) < timedelta(seconds=task_timeout):
+                            continue
                         connection.execute(
                             "UPDATE agent_tasks SET status='failed',finished_at=?,error='Agent task timed out' WHERE id=?",
                             (now, task["id"]),

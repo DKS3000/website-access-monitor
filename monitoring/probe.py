@@ -3,7 +3,7 @@
 import ipaddress
 import socket
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import requests
 
@@ -112,41 +112,54 @@ def probe_url(url, timeout=20, retries=0, proxy_url=None):
     for attempt in range(max(0, min(int(retries), 5)) + 1):
         started = time.perf_counter()
         try:
-            with requests.get(
-                url,
-                timeout=max(1, min(int(timeout), 120)),
-                allow_redirects=True,
-                stream=True,
-                verify=True,
-                proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
-                headers={"User-Agent": "WebsiteAccessMonitor/1.0 (+public reachability diagnostics)"},
-            ) as response:
-                result["response_time_ms"] = round((time.perf_counter() - started) * 1000, 2)
-                result["http_status"] = response.status_code
-                result["final_url"] = response.url
-                result["tls"] = _tls_info(response) if urlsplit(response.url).scheme == "https" else None
-                result["redirects"] = [
-                    {"url": item.url, "status": item.status_code, "location": item.headers.get("Location")}
-                    for item in response.history
-                ]
-                result["redirect_count"] = len(response.history)
-                result["headers"] = {
-                    key: value for key, value in response.headers.items()
-                    if key.lower() in RECORDED_HEADERS
-                }
-                body = bytearray()
-                for chunk in response.iter_content(64 * 1024):
-                    body.extend(chunk)
-                    if len(body) >= MAX_RESPONSE_BYTES:
-                        break
-                result["response_size"] = len(body)
-                if response.status_code == 403:
-                    result.update(status="error", classification="access_denied")
-                elif 200 <= response.status_code < 400:
-                    result.update(status="success", classification="reachable")
-                else:
-                    result.update(status="error", classification="http_error")
-                return result
+            current_url = url
+            redirects = []
+            for _ in range(11):
+                current_url = validate_public_url(current_url)
+                with requests.get(
+                    current_url,
+                    timeout=max(1, min(int(timeout), 120)),
+                    allow_redirects=False,
+                    stream=True,
+                    verify=True,
+                    proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
+                    headers={"User-Agent": "WebsiteAccessMonitor/1.0 (+public reachability diagnostics)"},
+                ) as response:
+                    location = response.headers.get("Location")
+                    if response.status_code in {301, 302, 303, 307, 308} and location:
+                        redirects.append(
+                            {"url": current_url, "status": response.status_code, "location": location}
+                        )
+                        current_url = urljoin(current_url, location)
+                        continue
+                    result["response_time_ms"] = round((time.perf_counter() - started) * 1000, 2)
+                    result["http_status"] = response.status_code
+                    result["final_url"] = current_url
+                    result["tls"] = _tls_info(response) if urlsplit(current_url).scheme == "https" else None
+                    result["redirects"] = redirects
+                    result["redirect_count"] = len(redirects)
+                    result["headers"] = {
+                        key: value for key, value in response.headers.items()
+                        if key.lower() in RECORDED_HEADERS
+                    }
+                    body = bytearray()
+                    for chunk in response.iter_content(64 * 1024):
+                        body.extend(chunk)
+                        if len(body) >= MAX_RESPONSE_BYTES:
+                            break
+                    result["response_size"] = len(body)
+                    if response.status_code == 403:
+                        result.update(status="error", classification="access_denied")
+                    elif 200 <= response.status_code < 400:
+                        result.update(status="success", classification="reachable")
+                    else:
+                        result.update(status="error", classification="http_error")
+                    return result
+            result.update(classification="http_error", error="Too many redirects.")
+            return result
+        except URLValidationError as exc:
+            result.update(classification="unsafe_redirect", error=str(exc))
+            return result
         except requests.exceptions.Timeout as exc:
             last_error = str(exc)
             result["classification"] = "timeout"
