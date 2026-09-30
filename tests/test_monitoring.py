@@ -292,22 +292,86 @@ class DashboardPersistenceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("vpn_provider", response.json["error"])
 
-    def test_vpn_route_created_and_task_carries_provider(self):
+    def test_vpn_route_blocks_task_until_verified_then_unblocks(self):
         agent = self.client.post("/api/agents", json={
             "name": "VPN agent", "country_code": "FR", "route_type": "vpn", "vpn_provider": "nordvpn",
         }).json
-        self.assertEqual(agent["agent"]["route_type"], "vpn")
-        self.assertEqual(agent["agent"]["vpn_provider"], "nordvpn")
+        agent_id = agent["agent"]["id"]
         target_id = self.add_target()
-        self.client.post("/api/jobs", json={
+        job = self.client.post("/api/jobs", json={
+            "target_id": target_id, "agent_ids": [agent_id],
+        }).json
+        self.assertEqual(job["status"], "waiting_for_vpn")
+        headers = {"Authorization": "Bearer " + agent["token"]}
+
+        # No verified VPN yet: the real probe task must never be handed out.
+        gated = self.client.get(f"/api/agent/{agent_id}/tasks/next", headers=headers)
+        self.assertTrue(gated.json["vpn_required"])
+        self.assertEqual(self.client.get("/api/jobs").json[0]["status"], "waiting_for_vpn")
+
+        # Operator explicitly requests the connection from the dashboard.
+        connect = self.client.post(f"/api/agents/{agent_id}/vpn/connect")
+        self.assertEqual(connect.status_code, 200)
+        self.assertEqual(connect.json["vpn_state"], "connecting")
+        profile = self.client.get(f"/api/agent/{agent_id}/profile", headers=headers).json
+        self.assertEqual(profile["vpn_command"], "connect")
+
+        # Agent reports a public IP that independently resolves to the assigned country.
+        self.app.config["IP_COUNTRY_RESOLVER"] = lambda ip: "FR"
+        report = self.client.post(
+            f"/api/agent/{agent_id}/vpn/state", headers=headers,
+            json={"state": "connected", "public_ip": "8.8.8.8"},
+        )
+        self.assertEqual(report.status_code, 200)
+        self.assertEqual(report.json["vpn_state"], "connected")
+        self.assertEqual(self.client.get("/api/jobs").json[0]["status"], "running")
+
+        task = self.client.get(f"/api/agent/{agent_id}/tasks/next", headers=headers)
+        self.assertFalse(task.json.get("vpn_required"))
+        self.assertEqual(task.json["vpn_provider"], "nordvpn")
+        self.assertEqual(task.json["country_code"], "FR")
+
+    def test_vpn_country_mismatch_fails_agent_and_blocked_job(self):
+        agent = self.client.post("/api/agents", json={
+            "name": "VPN agent", "country_code": "FR", "route_type": "vpn", "vpn_provider": "nordvpn",
+        }).json
+        agent_id = agent["agent"]["id"]
+        target_id = self.add_target()
+        job = self.client.post("/api/jobs", json={
+            "target_id": target_id, "agent_ids": [agent_id],
+        }).json
+        headers = {"Authorization": "Bearer " + agent["token"]}
+        self.client.post(f"/api/agents/{agent_id}/vpn/connect")
+
+        # The reported IP resolves to a different country than the one assigned to this agent.
+        self.app.config["IP_COUNTRY_RESOLVER"] = lambda ip: "DE"
+        report = self.client.post(
+            f"/api/agent/{agent_id}/vpn/state", headers=headers,
+            json={"state": "connected", "public_ip": "8.8.8.8"},
+        )
+        self.assertEqual(report.json["vpn_state"], "failed")
+        self.assertEqual(self.client.get("/api/agents").json[0]["vpn_state"], "failed")
+        self.assertEqual(self.client.get("/api/jobs").json[0]["status"], "failed")
+        self.assertEqual(self.client.get(f"/api/agent/{agent_id}/tasks/next", headers=headers).status_code, 204)
+
+    def test_vpn_connect_endpoint_rejects_non_vpn_agent(self):
+        agent = self.add_agent("Direct VPS", "GB")
+        response = self.client.post(f"/api/agents/{agent['agent']['id']}/vpn/connect")
+        self.assertEqual(response.status_code, 400)
+
+    def test_direct_route_agent_is_never_vpn_gated(self):
+        # Regression check: non-vpn agents must be unaffected by the hard gate.
+        target_id = self.add_target()
+        agent = self.add_agent("UK VPS", "GB")
+        job = self.client.post("/api/jobs", json={
             "target_id": target_id, "agent_ids": [agent["agent"]["id"]],
-        })
+        }).json
+        self.assertEqual(job["status"], "running")
         task = self.client.get(
             f"/api/agent/{agent['agent']['id']}/tasks/next",
             headers={"Authorization": "Bearer " + agent["token"]},
-        ).json
-        self.assertEqual(task["vpn_provider"], "nordvpn")
-        self.assertEqual(task["country_code"], "FR")
+        )
+        self.assertFalse(task.json.get("vpn_required"))
 
     def test_editing_agent_switches_country_and_route_without_new_token(self):
         created = self.add_agent("Roaming VPS", "FR")

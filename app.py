@@ -12,6 +12,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
+import requests
 from flask import Flask, jsonify, render_template, request
 
 from monitoring.database import Database, utcnow
@@ -21,6 +22,7 @@ from monitoring.probe import URLValidationError, validate_public_url
 SCHEDULES = {None, 300, 900, 1800, 3600, 86400}
 VPN_PROVIDERS = {"nordvpn", "mullvad"}
 ROUTE_TYPES = {"direct", "proxy", "vpn"}
+VPN_STATES = {"disconnected", "connecting", "connected", "failed", "disconnecting"}
 
 
 def create_app(test_config=None):
@@ -33,6 +35,7 @@ def create_app(test_config=None):
         DASHBOARD_TOKEN=os.environ.get("DASHBOARD_TOKEN", ""),
         START_SCHEDULER=True,
         MAX_CONTENT_LENGTH=64 * 1024,
+        IP_COUNTRY_RESOLVER=None,
     )
     if test_config:
         app.config.update(test_config)
@@ -53,6 +56,40 @@ def create_app(test_config=None):
     @app.errorhandler(URLValidationError)
     def invalid_url(exc):
         return jsonify({"error": str(exc)}), 400
+
+    def default_ip_country_resolver(ip):
+        """Independent, server-side IP -> ISO country lookup used to verify a VPN's real
+        egress country. This never trusts the agent's own claim; any network failure or
+        ambiguous result fails closed (returns None, which blocks the trial)."""
+        try:
+            response = requests.get(
+                f"https://ip-api.com/json/{ip}", params={"fields": "status,countryCode"}, timeout=5,
+            )
+            payload = response.json()
+        except (requests.RequestException, ValueError):
+            return None
+        if payload.get("status") != "success":
+            return None
+        return payload.get("countryCode")
+
+    def resolve_ip_country(ip):
+        resolver = app.config.get("IP_COUNTRY_RESOLVER") or default_ip_country_resolver
+        try:
+            return resolver(ip)
+        except Exception:  # pragma: no cover - defensive: never let a bad resolver crash the request
+            return None
+
+    def vpn_ready(agent):
+        """True if this agent's route does not require a VPN, or its VPN connection has
+        been independently verified (server-checked egress IP/country), for the exact
+        country the operator assigned. This is the hard backend gate: NO VERIFIED VPN = NO TRIAL."""
+        if agent["route_type"] != "vpn":
+            return True
+        return (
+            agent["vpn_state"] == "connected"
+            and bool(agent["vpn_verified_country"])
+            and agent["vpn_verified_country"].upper() == agent["country_code"].upper()
+        )
 
     @app.get("/")
     def dashboard():
@@ -125,7 +162,9 @@ def create_app(test_config=None):
         with db.connect() as connection:
             rows = connection.execute(
                 """SELECT a.id,a.name,a.country_code,c.name AS country,a.enabled,a.public_ip,
-                          a.route_type,a.proxy_url,a.vpn_provider,a.status,a.last_heartbeat,a.created_at
+                          a.route_type,a.proxy_url,a.vpn_provider,a.status,a.last_heartbeat,a.created_at,
+                          a.vpn_state,a.vpn_command,a.vpn_verified_ip,a.vpn_verified_country,
+                          a.vpn_verified_at,a.vpn_last_error
                    FROM agents a JOIN countries c ON c.code=a.country_code ORDER BY c.name,a.name"""
             ).fetchall()
             agents = []
@@ -276,14 +315,16 @@ def create_app(test_config=None):
                 (utcnow(), job_id),
             )
             return False
-        if job["status"] == "running":
+        if job["status"] in ("running", "waiting_for_vpn", "verifying_vpn"):
             return False
         sequence = connection.execute(
             "SELECT COALESCE(MAX(sequence),0)+1 FROM agent_tasks WHERE job_id=?", (job_id,)
         ).fetchone()[0]
+        first_agent = connection.execute("SELECT * FROM agents WHERE id=?", (agent_ids[0],)).fetchone()
+        status = "running" if vpn_ready(first_agent) else "waiting_for_vpn"
         connection.execute(
-            "UPDATE probe_jobs SET status='running',started_at=?,ended_at=NULL,current_index=0,error=NULL WHERE id=?",
-            (utcnow(), job_id),
+            "UPDATE probe_jobs SET status=?,started_at=?,ended_at=NULL,current_index=0,error=NULL WHERE id=?",
+            (status, utcnow(), job_id),
         )
         queue_task(connection, job, agent_ids[0], sequence)
         return True
@@ -330,7 +371,10 @@ def create_app(test_config=None):
                 "INSERT INTO audit_events(event_type,details_json,created_at) VALUES(?,?,?)",
                 ("job.created", db.json({"job_id": job_id}), now),
             )
-            return jsonify({"id": job_id, "status": "running"}), 201
+            actual_status = connection.execute(
+                "SELECT status FROM probe_jobs WHERE id=?", (job_id,)
+            ).fetchone()["status"]
+            return jsonify({"id": job_id, "status": actual_status}), 201
 
     @app.post("/api/jobs/<int:job_id>/pause")
     def pause_job(job_id):
@@ -431,6 +475,20 @@ def create_app(test_config=None):
             )
         return jsonify({"status": "online"})
 
+    @app.get("/api/agent/<int:agent_id>/profile")
+    def agent_profile(agent_id):
+        """Lets an agent learn its own current configuration/command without an active task,
+        so a vpn-route agent knows whether the operator has requested a VPN connect/disconnect."""
+        with db.connect() as connection:
+            if not agent_authorized(connection, agent_id):
+                return jsonify({"error": "Agent authentication failed."}), 401
+            row = connection.execute(
+                """SELECT id,country_code,route_type,proxy_url,vpn_provider,vpn_command,vpn_state
+                   FROM agents WHERE id=?""",
+                (agent_id,),
+            ).fetchone()
+            return jsonify(dict(row))
+
     @app.get("/api/agent/<int:agent_id>/tasks/next")
     def agent_next_task(agent_id):
         with db.connect() as connection:
@@ -443,7 +501,7 @@ def create_app(test_config=None):
             task = connection.execute(
                 """SELECT q.id AS task_id,q.job_id,j.target_id,j.timeout,j.retries,t.url,
                           a.name AS agent_name,a.country_code,a.public_ip,a.route_type,
-                          a.proxy_url,a.vpn_provider
+                          a.proxy_url,a.vpn_provider,a.vpn_state,a.vpn_verified_country
                    FROM agent_tasks q JOIN probe_jobs j ON j.id=q.job_id
                    JOIN targets t ON t.id=j.target_id JOIN agents a ON a.id=q.agent_id
                    WHERE q.agent_id=? AND q.status='queued' AND j.paused=0
@@ -452,11 +510,176 @@ def create_app(test_config=None):
             ).fetchone()
             if not task:
                 return "", 204
+            # Hard backend gate: a vpn-route agent is never handed the real probe request
+            # unless the server has independently verified its VPN egress. This is checked
+            # on every poll (not just once), so a trial can never silently run over the
+            # normal Internet connection.
+            if not vpn_ready(task):
+                connection.execute(
+                    """UPDATE probe_jobs SET status='waiting_for_vpn'
+                       WHERE id=? AND status NOT IN ('waiting_for_vpn','verifying_vpn')""",
+                    (task["job_id"],),
+                )
+                return jsonify({
+                    "vpn_required": True,
+                    "vpn_provider": task["vpn_provider"],
+                    "vpn_state": task["vpn_state"],
+                    "country_code": task["country_code"],
+                })
+            connection.execute(
+                """UPDATE probe_jobs SET status='running'
+                   WHERE id=? AND status IN ('waiting_for_vpn','verifying_vpn')""",
+                (task["job_id"],),
+            )
             connection.execute(
                 "UPDATE agent_tasks SET status='running',started_at=? WHERE id=?",
                 (utcnow(), task["task_id"]),
             )
             return jsonify(dict(task))
+
+    def blocked_jobs_for_agent(connection, agent_id):
+        """Jobs currently paused on this agent's unverified VPN connection."""
+        return connection.execute(
+            """SELECT DISTINCT j.id FROM probe_jobs j JOIN agent_tasks q ON q.job_id=j.id
+               WHERE q.agent_id=? AND q.status='queued' AND j.status IN ('waiting_for_vpn','verifying_vpn')""",
+            (agent_id,),
+        ).fetchall()
+
+    def fail_blocked_jobs(connection, agent_id, blocked, reason, now):
+        for job in blocked:
+            connection.execute(
+                """UPDATE agent_tasks SET status='failed',finished_at=?,error=?
+                   WHERE job_id=? AND agent_id=? AND status='queued'""",
+                (now, reason, job["id"], agent_id),
+            )
+            connection.execute(
+                "UPDATE probe_jobs SET status='failed',ended_at=?,error=? WHERE id=?",
+                (now, reason, job["id"]),
+            )
+
+    @app.post("/api/agent/<int:agent_id>/vpn/state")
+    def agent_vpn_state(agent_id):
+        """An agent reports its locally-observed VPN state. A claimed 'connected' state is
+        never trusted on its own: the server independently resolves the reported public IP
+        to a country and only marks the VPN verified if that matches the assigned country."""
+        data = request.get_json(silent=True) or {}
+        state = data.get("state")
+        if state not in VPN_STATES:
+            return jsonify({"error": "state must be one of: " + ", ".join(sorted(VPN_STATES))}), 400
+        with db.connect() as connection:
+            if not agent_authorized(connection, agent_id):
+                return jsonify({"error": "Agent authentication failed."}), 401
+            agent = connection.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+            if agent["route_type"] != "vpn":
+                return jsonify({"error": "Agent is not configured for a vpn route."}), 400
+            now = utcnow()
+            if state == "connecting":
+                connection.execute(
+                    "UPDATE agents SET vpn_state='connecting',vpn_state_updated_at=? WHERE id=?",
+                    (now, agent_id),
+                )
+                return jsonify({"vpn_state": "connecting"})
+            if state == "connected":
+                public_ip = str(data.get("public_ip", "")).strip()
+                try:
+                    valid_ip = bool(public_ip) and ipaddress.ip_address(public_ip).is_global
+                except ValueError:
+                    valid_ip = False
+                if not valid_ip:
+                    return jsonify({"error": "A valid public egress IP is required to verify a VPN connection."}), 400
+                blocked = blocked_jobs_for_agent(connection, agent_id)
+                resolved = resolve_ip_country(public_ip)
+                if resolved and resolved.upper() == agent["country_code"].upper():
+                    connection.execute(
+                        """UPDATE agents SET vpn_state='connected',vpn_command=NULL,vpn_verified_ip=?,
+                           vpn_verified_country=?,vpn_verified_at=?,vpn_last_error=NULL,vpn_state_updated_at=?
+                           WHERE id=?""",
+                        (public_ip[:64], resolved, now, now, agent_id),
+                    )
+                    for job in blocked:
+                        connection.execute("UPDATE probe_jobs SET status='running' WHERE id=?", (job["id"],))
+                    connection.execute(
+                        "INSERT INTO audit_events(event_type,details_json,created_at) VALUES(?,?,?)",
+                        ("agent.vpn_verified", db.json({"agent_id": agent_id, "country_code": resolved}), now),
+                    )
+                    return jsonify({"vpn_state": "connected", "verified_country": resolved})
+                reason = (
+                    f"Egress IP resolved to {resolved}, not the assigned country {agent['country_code']}."
+                    if resolved else "Could not independently verify the VPN egress country for this IP."
+                )[:500]
+                connection.execute(
+                    """UPDATE agents SET vpn_state='failed',vpn_command=NULL,vpn_verified_ip=NULL,
+                       vpn_verified_country=NULL,vpn_verified_at=NULL,vpn_last_error=?,vpn_state_updated_at=?
+                       WHERE id=?""",
+                    (reason, now, agent_id),
+                )
+                fail_blocked_jobs(connection, agent_id, blocked, reason, now)
+                connection.execute(
+                    "INSERT INTO audit_events(event_type,details_json,created_at) VALUES(?,?,?)",
+                    ("agent.vpn_verification_failed", db.json({"agent_id": agent_id, "reason": reason}), now),
+                )
+                return jsonify({"vpn_state": "failed", "error": reason})
+            if state == "failed":
+                reason = str(data.get("error") or "VPN connection failed.")[:500]
+                blocked = blocked_jobs_for_agent(connection, agent_id)
+                connection.execute(
+                    """UPDATE agents SET vpn_state='failed',vpn_command=NULL,vpn_verified_ip=NULL,
+                       vpn_verified_country=NULL,vpn_verified_at=NULL,vpn_last_error=?,vpn_state_updated_at=?
+                       WHERE id=?""",
+                    (reason, now, agent_id),
+                )
+                fail_blocked_jobs(connection, agent_id, blocked, reason, now)
+                connection.execute(
+                    "INSERT INTO audit_events(event_type,details_json,created_at) VALUES(?,?,?)",
+                    ("agent.vpn_connect_failed", db.json({"agent_id": agent_id, "reason": reason}), now),
+                )
+                return jsonify({"vpn_state": "failed", "error": reason})
+            # disconnecting / disconnected: clear verification so the gate stays closed.
+            connection.execute(
+                """UPDATE agents SET vpn_state=?,vpn_command=NULL,vpn_verified_ip=NULL,
+                   vpn_verified_country=NULL,vpn_verified_at=NULL,vpn_state_updated_at=? WHERE id=?""",
+                (state, now, agent_id),
+            )
+            return jsonify({"vpn_state": state})
+
+    @app.post("/api/agents/<int:agent_id>/vpn/connect")
+    def request_vpn_connect(agent_id):
+        """Operator-initiated: mark this vpn-route agent for connection. No trial is started
+        here; a matching agent_tasks row stays queued until the agent reports and the server
+        verifies a matching connection."""
+        with db.connect() as connection:
+            agent = connection.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+            if not agent:
+                return jsonify({"error": "Agent not found."}), 404
+            if agent["route_type"] != "vpn":
+                return jsonify({"error": "Agent is not configured for a vpn route."}), 400
+            now = utcnow()
+            connection.execute(
+                """UPDATE agents SET vpn_command='connect',vpn_state='connecting',vpn_state_updated_at=?
+                   WHERE id=?""",
+                (now, agent_id),
+            )
+            connection.execute(
+                "INSERT INTO audit_events(event_type,details_json,created_at) VALUES(?,?,?)",
+                ("agent.vpn_connect_requested",
+                 db.json({"agent_id": agent_id, "country_code": agent["country_code"]}), now),
+            )
+        return jsonify({"vpn_state": "connecting"})
+
+    @app.post("/api/agents/<int:agent_id>/vpn/disconnect")
+    def request_vpn_disconnect(agent_id):
+        with db.connect() as connection:
+            agent = connection.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+            if not agent:
+                return jsonify({"error": "Agent not found."}), 404
+            if agent["route_type"] != "vpn":
+                return jsonify({"error": "Agent is not configured for a vpn route."}), 400
+            connection.execute(
+                """UPDATE agents SET vpn_command='disconnect',vpn_state='disconnecting',vpn_state_updated_at=?
+                   WHERE id=?""",
+                (utcnow(), agent_id),
+            )
+        return jsonify({"vpn_state": "disconnecting"})
 
     @app.post("/api/agent/<int:agent_id>/tasks/<int:task_id>/result")
     def agent_submit_result(agent_id, task_id):
@@ -531,8 +754,12 @@ def create_app(test_config=None):
                     (job["id"],),
                 ).fetchone()[0]
                 queue_task(connection, job, agent_ids[next_index], sequence)
+                next_agent = connection.execute(
+                    "SELECT * FROM agents WHERE id=?", (agent_ids[next_index],)
+                ).fetchone()
                 connection.execute(
-                    "UPDATE probe_jobs SET current_index=? WHERE id=?", (next_index, job["id"])
+                    "UPDATE probe_jobs SET current_index=?,status=? WHERE id=?",
+                    (next_index, "running" if vpn_ready(next_agent) else "waiting_for_vpn", job["id"]),
                 )
             else:
                 run_status = (
@@ -565,13 +792,18 @@ def create_app(test_config=None):
                 begin_job(connection, row["id"])
             stale = connection.execute(
                 """SELECT q.*,j.target_id,j.agent_ids,j.current_index,j.schedule_interval,j.paused,
-                          j.timeout,j.retries,a.country_code,a.name AS agent_name,a.public_ip
+                          j.timeout,j.retries,j.status AS job_status,a.country_code,a.name AS agent_name,a.public_ip
                    FROM agent_tasks q JOIN probe_jobs j ON j.id=q.job_id
                    JOIN agents a ON a.id=q.agent_id
                    WHERE q.status IN ('queued','running')"""
             ).fetchall()
             for task in stale:
                 if task["status"] == "queued":
+                    # A task withheld by the VPN hard gate stays "queued" indefinitely by
+                    # design (it is legitimately waiting on operator VPN action), so it must
+                    # not be treated as a stale/abandoned claim.
+                    if task["job_status"] in ("waiting_for_vpn", "verifying_vpn"):
+                        continue
                     elapsed_from = task["created_at"]
                     task_timeout = 120
                 else:

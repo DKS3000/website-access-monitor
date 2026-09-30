@@ -23,7 +23,10 @@ CREATE TABLE IF NOT EXISTS agents (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, country_code TEXT NOT NULL REFERENCES countries(code),
   enabled INTEGER NOT NULL DEFAULT 1, token_hash TEXT NOT NULL, public_ip TEXT,
   route_type TEXT NOT NULL DEFAULT 'direct', proxy_url TEXT, vpn_provider TEXT,
-  status TEXT NOT NULL DEFAULT 'offline', last_heartbeat TEXT, created_at TEXT NOT NULL
+  status TEXT NOT NULL DEFAULT 'offline', last_heartbeat TEXT, created_at TEXT NOT NULL,
+  vpn_state TEXT NOT NULL DEFAULT 'disconnected', vpn_command TEXT,
+  vpn_verified_ip TEXT, vpn_verified_country TEXT, vpn_verified_at TEXT,
+  vpn_last_error TEXT, vpn_state_updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS probe_jobs (
   id INTEGER PRIMARY KEY, target_id INTEGER NOT NULL REFERENCES targets(id), status TEXT NOT NULL,
@@ -109,6 +112,20 @@ class Database:
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(agents)")}
         if "vpn_provider" not in columns:
             connection.execute("ALTER TABLE agents ADD COLUMN vpn_provider TEXT")
+        if "vpn_state" not in columns:
+            connection.execute("ALTER TABLE agents ADD COLUMN vpn_state TEXT NOT NULL DEFAULT 'disconnected'")
+        if "vpn_command" not in columns:
+            connection.execute("ALTER TABLE agents ADD COLUMN vpn_command TEXT")
+        if "vpn_verified_ip" not in columns:
+            connection.execute("ALTER TABLE agents ADD COLUMN vpn_verified_ip TEXT")
+        if "vpn_verified_country" not in columns:
+            connection.execute("ALTER TABLE agents ADD COLUMN vpn_verified_country TEXT")
+        if "vpn_verified_at" not in columns:
+            connection.execute("ALTER TABLE agents ADD COLUMN vpn_verified_at TEXT")
+        if "vpn_last_error" not in columns:
+            connection.execute("ALTER TABLE agents ADD COLUMN vpn_last_error TEXT")
+        if "vpn_state_updated_at" not in columns:
+            connection.execute("ALTER TABLE agents ADD COLUMN vpn_state_updated_at TEXT")
 
     @staticmethod
     def row(row):

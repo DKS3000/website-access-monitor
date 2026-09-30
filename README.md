@@ -44,14 +44,38 @@ Use a service manager (for example systemd) to keep the agent running. Agent con
 
 For a local development agent, use `--central-url http://127.0.0.1:5000`. If a public egress IP is not supplied, the result leaves it blank rather than contacting an IP-echo service.
 
-### VPN route (NordVPN / Mullvad)
+### VPN route (NordVPN / Mullvad) — mandatory, server-verified egress
 
-Instead of maintaining a separate VPS per country, an agent can use a pre-configured, already-logged-in NordVPN or Mullvad client on its host. Choose "Pre-configured VPN client" as the route when adding the agent, pick the VPN provider, and set the agent's country to the location to monitor from. On the agent's host:
+Instead of maintaining a separate VPS per country, an agent can use a pre-configured, already-logged-in NordVPN or Mullvad client on its host. Choose "Pre-configured VPN client" as the route when adding the agent, pick the VPN provider, and set the agent's country to the location to monitor from.
 
-- Install and authenticate the client yourself ahead of time (`nordvpn login` or `mullvad account login`); the app never stores or transmits VPN account credentials.
-- The agent, before each probe, confirms via `nordvpn status` / `mullvad status` that the client is already connected to the assigned country and issues `nordvpn connect <country>` / `mullvad relay set location <code>` + `mullvad connect` only if it is not. It never tries other countries or servers to get around a 403 — it always targets the single country you configured for that agent.
-- To monitor from a different country, edit the agent in the dashboard and change its country (and/or VPN provider); no re-enrollment or new token is required. The agent picks up the new assignment on its next queued task.
-- If the client cannot confirm the connection within about 45 seconds (not installed, not logged in, or an invalid location), the task is recorded with the `vpn_error` classification and the probe is not attempted, so a result is never misattributed to the wrong vantage point.
+**Hard rule: no verified VPN, no trial.** For a `vpn` route agent, the dashboard/backend never hands out a real probe request until the server has independently verified that agent's VPN egress country. This is enforced in `GET /api/agent/<id>/tasks/next` itself — the single endpoint every probe task is ever served through — not by disabling a frontend button, so a modified agent client cannot bypass it. A monitoring trial for a vpn-route agent never silently falls back to the host's normal Internet connection.
+
+Sequence when you select a country and start a trial:
+
+1. You add/edit the agent's country and click **Connect VPN** in the dashboard (`POST /api/agents/<id>/vpn/connect`). This only records the operator's request (`vpn_state=connecting`); it does not start the trial.
+2. On its next poll, the agent's client sees the pending `connect` command, runs `nordvpn connect <country>` / `mullvad relay set location <code>` + `mullvad connect`, and reports its state to `POST /api/agent/<id>/vpn/state`.
+3. On a report of `state=connected`, the agent also sends its self-detected public egress IP as *evidence only*. The server independently re-resolves that IP to a country via a pluggable IP→country lookup and only marks the agent `vpn_state=connected` if the resolved country matches the one you assigned. Any lookup failure fails closed (never treated as verified).
+4. Only once `vpn_state=connected` and the verified country matches does any job queued for that agent move from `waiting_for_vpn` to `running`, and does `tasks/next` return the real probe task instead of `{"vpn_required": true, ...}`.
+5. The agent re-checks and re-reports its VPN state on every poll cycle (not just once), so if the VPN drops mid-run the gate closes again automatically on the very next cycle — it never keeps probing over a stale "connected" state.
+6. Click **Disconnect VPN** to explicitly tear the connection down (`POST /api/agents/<id>/vpn/disconnect`); this also clears the stored verification, so any subsequent trial is gated again until reconnected.
+
+Direct and proxy route agents are unaffected by any of this and continue to run immediately, as before.
+
+#### VPN state machine (per agent)
+
+`disconnected → connecting → connected → disconnecting → disconnected`, with `failed` reachable from `connecting`/`connected` on a failed connect or a country-verification mismatch.
+
+#### Trial (job) state machine
+
+`idle → waiting_for_vpn → verifying_vpn → running → (paused | completed | failed)`. Non-VPN (`direct`/`proxy`) jobs skip straight from creation to `running`, since they have no VPN prerequisite.
+
+#### New API endpoints
+
+- `POST /api/agents/<id>/vpn/connect` / `POST /api/agents/<id>/vpn/disconnect` — dashboard-facing, operator-initiated.
+- `GET /api/agent/<id>/profile` — agent-facing (Bearer token), lets the agent learn its assigned country/pending VPN command without an active task.
+- `POST /api/agent/<id>/vpn/state` — agent-facing (Bearer token); the agent reports its locally observed state plus (when claiming `connected`) its detected public IP for independent server-side verification.
+
+**Application startup**: the dashboard starts with every job idle and no agent auto-connected — nothing is monitored automatically. The operator must always explicitly select a country and click Connect VPN (or use a direct/proxy agent) before any trial can run.
 
 
 ## Dashboard workflow

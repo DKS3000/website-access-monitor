@@ -94,23 +94,41 @@ function routeLabel(a) {
   return "direct";
 }
 
+function vpnStatus(a) {
+  if (a.route_type !== "vpn") return "";
+  const stateLabel = escapeHtml((a.vpn_state || "disconnected").replace(/_/g, " "));
+  let extra = "";
+  if (a.vpn_state === "connected" && a.vpn_verified_country) {
+    extra = ` · verified egress ${escapeHtml(a.vpn_verified_country)}${a.vpn_verified_ip ? ` (${escapeHtml(a.vpn_verified_ip)})` : ""}`;
+  } else if (a.vpn_state === "failed" && a.vpn_last_error) {
+    extra = ` · ${escapeHtml(a.vpn_last_error)}`;
+  }
+  return ` · vpn: ${stateLabel}${extra}`;
+}
+
 function renderAgents(agents) {
   const selected = new Set([...document.querySelectorAll("#agentChoices input:checked")].map(input => input.value));
   document.querySelector("#agents").innerHTML = agents.map(a => `
     <div class="item"><div><strong>${escapeHtml(a.name)}</strong> · ${escapeHtml(a.country)} (${escapeHtml(a.country_code)})<br>
-    <small>${routeLabel(a)} · ${escapeHtml(a.public_ip || "public IP not configured")} · ${escapeHtml(a.status)}${a.last_heartbeat ? ` · heartbeat ${escapeHtml(a.last_heartbeat)}` : ""}</small></div>
-    <span class="target-actions"><button data-action="edit-agent" data-id="${a.id}">Edit</button>
+    <small>${routeLabel(a)} · ${escapeHtml(a.public_ip || "public IP not configured")} · ${escapeHtml(a.status)}${a.last_heartbeat ? ` · heartbeat ${escapeHtml(a.last_heartbeat)}` : ""}${vpnStatus(a)}</small></div>
+    <span class="target-actions">${a.route_type === "vpn" ? `<button data-action="connect-vpn" data-id="${a.id}" ${a.vpn_state === "connected" || a.vpn_state === "connecting" ? "disabled" : ""}>Connect VPN</button>
+    <button data-action="disconnect-vpn" data-id="${a.id}" ${a.vpn_state === "disconnected" ? "disabled" : ""}>Disconnect VPN</button>` : ""}
+    <button data-action="edit-agent" data-id="${a.id}">Edit</button>
     <button data-action="toggle-agent" data-id="${a.id}" data-enabled="${a.enabled ? 0 : 1}">${a.enabled ? "Disable" : "Enable"}</button></span></div>`).join("") || '<p class="muted">Enroll and start an agent on each VPS/vantage point.</p>';
   document.querySelector("#agentChoices").innerHTML = agents.filter(a => a.enabled).map(a =>
     `<label><input type="checkbox" value="${a.id}" ${selected.has(String(a.id)) ? "checked" : ""}> ${escapeHtml(a.country)} · ${escapeHtml(a.name)}</label>`
   ).join("") || '<span class="muted">Add an agent before running probes.</span>';
 }
 
+function jobStatusLabel(status) {
+  return escapeHtml((status || "").replace(/_/g, " "));
+}
+
 function renderJobs(jobs) {
   document.querySelector("#jobs").innerHTML = jobs.slice(0, 10).map(j => `
     <div class="item"><div><strong>Job #${j.id} · ${escapeHtml(j.target_name || j.target_url)}</strong><br>
-    <small>${escapeHtml(j.status)} · started ${escapeHtml(j.started_at || "not yet")} · schedule ${j.schedule_interval ? `every ${j.schedule_interval}s` : "once"}${j.error ? ` · ${escapeHtml(j.error)}` : ""}</small></div>
-    <span class="job-actions">${j.paused ? `<button data-action="resume-job" data-id="${j.id}">Resume</button>` : ["running","scheduled","queued"].includes(j.status) ? `<button data-action="pause-job" data-id="${j.id}">Pause</button>` : ""}
+    <small>${jobStatusLabel(j.status)} · started ${escapeHtml(j.started_at || "not yet")} · schedule ${j.schedule_interval ? `every ${j.schedule_interval}s` : "once"}${j.error ? ` · ${escapeHtml(j.error)}` : ""}</small></div>
+    <span class="job-actions">${j.paused ? `<button data-action="resume-job" data-id="${j.id}">Resume</button>` : ["running","scheduled","queued","waiting_for_vpn","verifying_vpn"].includes(j.status) ? `<button data-action="pause-job" data-id="${j.id}">Pause</button>` : ""}
     <button data-action="retry-job" data-id="${j.id}">Run again</button></span></div>`).join("") || '<p class="muted">No probe jobs yet.</p>';
 }
 
@@ -302,6 +320,10 @@ document.body.addEventListener("click", async event => {
       if (window.confirm("Delete this target? Targets with saved history must be disabled instead.")) await api(`/api/targets/${id}`, {method: "DELETE"});
     } else if (action === "toggle-agent") {
       await api(`/api/agents/${id}`, {method: "PATCH", body: JSON.stringify({enabled: button.dataset.enabled === "1"})});
+    } else if (action === "connect-vpn") {
+      await api(`/api/agents/${id}/vpn/connect`, {method: "POST", body: "{}"});
+    } else if (action === "disconnect-vpn") {
+      await api(`/api/agents/${id}/vpn/disconnect`, {method: "POST", body: "{}"});
     } else if (action === "edit-agent") {
       const agent = lastAgents.find(a => String(a.id) === id);
       if (!agent) return;

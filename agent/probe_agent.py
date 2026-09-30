@@ -22,6 +22,14 @@ def _run(command, timeout=20):
     return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
 
 
+def nordvpn_disconnect():
+    return _run(["nordvpn", "disconnect"], timeout=VPN_CONNECT_TIMEOUT)
+
+
+def mullvad_disconnect():
+    return _run(["mullvad", "disconnect"], timeout=VPN_CONNECT_TIMEOUT)
+
+
 def nordvpn_current_country():
     """Return the country NordVPN's CLI reports itself connected to, or None."""
     try:
@@ -55,6 +63,7 @@ VPN_BACKENDS = {
     "nordvpn": {
         "current_country": nordvpn_current_country,
         "connect": lambda country: _run(["nordvpn", "connect", country], timeout=VPN_CONNECT_TIMEOUT),
+        "disconnect": nordvpn_disconnect,
     },
     "mullvad": {
         "current_country": mullvad_current_country,
@@ -62,6 +71,7 @@ VPN_BACKENDS = {
             _run(["mullvad", "relay", "set", "location", country.lower()], timeout=VPN_CONNECT_TIMEOUT),
             _run(["mullvad", "connect"], timeout=VPN_CONNECT_TIMEOUT),
         ),
+        "disconnect": mullvad_disconnect,
     },
 }
 
@@ -94,6 +104,86 @@ def ensure_vpn_connected(provider, country, deadline_seconds=VPN_CONNECT_TIMEOUT
     )
 
 
+def detect_public_ip(session, timeout=10):
+    """Self-detect the current egress IP, sent to the server as evidence only. The server
+    never trusts this on its own -- it independently re-resolves the IP to a country."""
+    try:
+        response = session.get("https://api.ipify.org", params={"format": "text"}, timeout=timeout)
+        response.raise_for_status()
+        ip = response.text.strip()
+        return ip or None
+    except requests.RequestException:
+        return None
+
+
+def report_vpn_state(session, central_url, agent_id, headers, state, public_ip=None, error=None):
+    payload = {"state": state}
+    if public_ip:
+        payload["public_ip"] = public_ip
+    if error:
+        payload["error"] = error[:500]
+    try:
+        response = session.post(
+            f"{central_url}/api/agent/{agent_id}/vpn/state",
+            json=payload, headers=headers, timeout=20,
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as exc:
+        print(f"Could not report vpn state '{state}': {exc}")
+        return {}
+
+
+def sync_vpn_state(session, central_url, agent_id, headers, profile):
+    """Called on every poll cycle for a vpn-route agent: checks the real, local VPN client
+    state and keeps the server's picture of it fresh. This is what closes the gate again
+    automatically if a VPN connection silently drops mid-operation.
+
+    An actual connect/disconnect CLI command is only ever issued when the operator has
+    explicitly requested it via the dashboard (profile['vpn_command']); a routine status
+    check by itself never triggers a new connection attempt.
+    """
+    provider = profile.get("vpn_provider")
+    country = profile.get("country_code")
+    backend = VPN_BACKENDS.get(provider)
+    if not backend:
+        report_vpn_state(session, central_url, agent_id, headers, "failed",
+                          error=f"Unsupported vpn_provider '{provider}'.")
+        return
+    current = backend["current_country"]()
+    if current and current.lower() == (country or "").lower():
+        public_ip = detect_public_ip(session)
+        if public_ip:
+            report_vpn_state(session, central_url, agent_id, headers, "connected", public_ip=public_ip)
+        else:
+            report_vpn_state(session, central_url, agent_id, headers, "failed",
+                              error="Connected locally but could not detect a public egress IP to verify.")
+        return
+    command = profile.get("vpn_command")
+    if command == "connect":
+        report_vpn_state(session, central_url, agent_id, headers, "connecting")
+        try:
+            ensure_vpn_connected(provider, country)
+        except VPNError as exc:
+            report_vpn_state(session, central_url, agent_id, headers, "failed", error=str(exc))
+            return
+        public_ip = detect_public_ip(session)
+        if public_ip:
+            report_vpn_state(session, central_url, agent_id, headers, "connected", public_ip=public_ip)
+        else:
+            report_vpn_state(session, central_url, agent_id, headers, "failed",
+                              error="Connected locally but could not detect a public egress IP to verify.")
+        return
+    if command == "disconnect":
+        try:
+            backend["disconnect"]()
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"Could not disconnect {provider}: {exc}")
+        report_vpn_state(session, central_url, agent_id, headers, "disconnected")
+        return
+    report_vpn_state(session, central_url, agent_id, headers, "disconnected")
+
+
 def run_agent(central_url, agent_id, token, public_ip=None, poll_interval=3):
     central_url = central_url.rstrip("/")
     headers = {"Authorization": "Bearer " + token}
@@ -106,6 +196,13 @@ def run_agent(central_url, agent_id, token, public_ip=None, poll_interval=3):
                 headers=headers,
                 timeout=10,
             ).raise_for_status()
+            profile_response = session.get(
+                f"{central_url}/api/agent/{agent_id}/profile", headers=headers, timeout=10,
+            )
+            profile_response.raise_for_status()
+            profile = profile_response.json()
+            if profile.get("route_type") == "vpn":
+                sync_vpn_state(session, central_url, agent_id, headers, profile)
             response = session.get(
                 f"{central_url}/api/agent/{agent_id}/tasks/next",
                 headers=headers,
@@ -116,19 +213,16 @@ def run_agent(central_url, agent_id, token, public_ip=None, poll_interval=3):
                 continue
             response.raise_for_status()
             task = response.json()
-            vpn_provider = task.get("vpn_provider")
-            if vpn_provider:
-                try:
-                    ensure_vpn_connected(vpn_provider, task["country_code"])
-                except VPNError as exc:
-                    session.post(
-                        f"{central_url}/api/agent/{agent_id}/tasks/{task['task_id']}/result",
-                        json={"classification": "vpn_error", "error": str(exc)},
-                        headers=headers,
-                        timeout=20,
-                    ).raise_for_status()
-                    print(f"Task {task['task_id']}: vpn_error {exc}")
-                    continue
+            if task.get("vpn_required"):
+                # The server withheld the real probe request because the VPN connection has
+                # not (yet) been independently verified. Never fall back to the normal
+                # Internet connection -- just wait for the next poll cycle.
+                print(
+                    f"Waiting for verified VPN ({task.get('vpn_provider')} -> "
+                    f"{task.get('country_code')}); current state: {task.get('vpn_state')}"
+                )
+                time.sleep(poll_interval)
+                continue
             result = probe_url(
                 task["url"],
                 timeout=task["timeout"],
