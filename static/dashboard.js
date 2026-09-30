@@ -89,24 +89,35 @@ function renderChart(results) {
   canvas.height = height * ratio;
   context.scale(ratio, ratio);
   context.clearRect(0, 0, width, height);
-  const values = results.filter(r => r.response_time_ms != null).slice().reverse();
-  if (!values.length) {
+  const groups = new Map();
+  for (const result of results.filter(r => r.response_time_ms != null).slice().reverse()) {
+    const label = `${result.country || "Unknown"} · ${result.agent_name || "Agent"}`;
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(result);
+  }
+  if (!groups.size) {
     context.fillStyle = "#718096";
     context.fillText("Latency history appears after the first completed probe.", 14, 30);
     return;
   }
-  const max = Math.max(...values.map(r => r.response_time_ms), 1);
+  const max = Math.max(...[...groups.values()].flat().map(r => r.response_time_ms), 1);
   context.strokeStyle = "#d9e1ef";
   context.beginPath(); context.moveTo(35, 12); context.lineTo(35, height - 28); context.lineTo(width - 10, height - 28); context.stroke();
-  context.strokeStyle = "#2d63cb";
+  const colors = ["#2d63cb", "#16855b", "#cb6b26", "#a34fb0", "#dc3f54", "#078b9c"];
   context.lineWidth = 2;
-  context.beginPath();
-  values.forEach((r, index) => {
-    const x = 38 + index * ((width - 54) / Math.max(values.length - 1, 1));
-    const y = height - 30 - (r.response_time_ms / max) * (height - 55);
-    if (!index) context.moveTo(x, y); else context.lineTo(x, y);
+  [...groups.entries()].forEach(([label, values], groupIndex) => {
+    context.strokeStyle = colors[groupIndex % colors.length];
+    context.beginPath();
+    values.forEach((r, index) => {
+      const x = 38 + index * ((width - 54) / Math.max(values.length - 1, 1));
+      const y = height - 30 - (r.response_time_ms / max) * (height - 55);
+      if (!index) context.moveTo(x, y); else context.lineTo(x, y);
+    });
+    context.stroke();
+    context.fillStyle = colors[groupIndex % colors.length];
+    context.font = "11px system-ui";
+    context.fillText(label, 45 + (groupIndex % 3) * (width / 3), 16 + Math.floor(groupIndex / 3) * 13);
   });
-  context.stroke();
   context.fillStyle = "#526078"; context.font = "11px system-ui";
   context.fillText(`${Math.round(max)} ms max`, 8, 12);
 }
@@ -122,20 +133,39 @@ async function refreshResults() {
     <td><button data-action="details" data-id="${r.id}">View details</button>
     ${r.status === "success" ? `<a target="_blank" rel="noopener noreferrer" href="${escapeHtml(r.target_url)}">Open Page</a>` : ""}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">No results for this target yet.</td></tr>';
   const counts = {reachable: 0, denied: 0, failures: 0};
+  const statusCounts = new Map();
+  const routeStats = new Map();
   for (const r of results) {
     if (r.classification === "reachable") counts.reachable++;
     else if (r.classification === "access_denied") counts.denied++;
     else counts.failures++;
+    const statusKey = r.http_status == null ? "Network error" : `HTTP ${r.http_status}`;
+    statusCounts.set(statusKey, (statusCounts.get(statusKey) || 0) + 1);
+    const route = `${r.country || "Unknown"} · ${r.agent_name || "Agent"}`;
+    if (!routeStats.has(route)) routeStats.set(route, {total: 0, success: 0, denied: 0, latency: [], redirects: 0});
+    const stats = routeStats.get(route);
+    stats.total++;
+    if (r.status === "success") stats.success++;
+    if (r.classification === "access_denied") stats.denied++;
+    if (r.response_time_ms != null) stats.latency.push(r.response_time_ms);
+    stats.redirects += r.redirect_count || 0;
   }
   const latestByCountry = new Map();
   for (const r of results) if (r.country && !latestByCountry.has(r.country)) latestByCountry.set(r.country, r);
   const has403 = [...latestByCountry.values()].some(r => r.http_status === 403);
   const hasSuccess = [...latestByCountry.values()].some(r => r.status === "success");
   const insight = has403 && hasSuccess ? '<span class="badge danger">Route-specific difference detected: successful and HTTP 403 routes coexist. Compare DNS, TLS, headers, and egress IP; no bypass is attempted.</span>' : "";
+  const availability = results.length ? ((counts.reachable / results.length) * 100).toFixed(1) : "0.0";
   document.querySelector("#summary").innerHTML = `
+    <span class="badge">Availability<strong>${availability}%</strong></span>
     <span class="badge success">Reachable<strong>${counts.reachable}</strong></span>
     <span class="badge danger">HTTP 403<strong>${counts.denied}</strong></span>
-    <span class="badge">Other failures<strong>${counts.failures}</strong></span>${insight}`;
+    <span class="badge">Other failures<strong>${counts.failures}</strong></span>
+    ${[...statusCounts.entries()].map(([status, count]) => `<span class="badge">${escapeHtml(status)}<strong>${count}</strong></span>`).join("")}${insight}`;
+  document.querySelector("#routeComparison").innerHTML = [...routeStats.entries()].map(([route, stats]) => `
+    <tr><td>${escapeHtml(route)}</td><td>${((stats.success / stats.total) * 100).toFixed(1)}% (${stats.success}/${stats.total})</td>
+    <td>${stats.latency.length ? `${Math.round(stats.latency.reduce((a, b) => a + b, 0) / stats.latency.length)} ms` : "—"}</td>
+    <td>${stats.denied}</td><td>${stats.redirects}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">No route history yet.</td></tr>';
   renderChart(results);
   tbody.querySelectorAll('[data-action="details"]').forEach(button => button.addEventListener("click", () => {
     const item = results.find(r => String(r.id) === button.dataset.id);

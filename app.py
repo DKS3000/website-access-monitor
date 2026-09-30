@@ -504,62 +504,81 @@ def create_app(test_config=None):
                 )
             return jsonify({"status": "stored", "result_id": result_id})
 
+    def scheduler_tick():
+        with db.connect() as connection:
+            now = utcnow()
+            due = connection.execute(
+                """SELECT id FROM probe_jobs WHERE schedule_interval IS NOT NULL
+                   AND paused=0 AND status='scheduled' AND next_run_at<=? ORDER BY next_run_at""",
+                (now,),
+            ).fetchall()
+            for row in due:
+                begin_job(connection, row["id"])
+            stale = connection.execute(
+                """SELECT q.*,j.target_id,j.agent_ids,j.current_index,j.schedule_interval,j.paused,
+                          j.timeout,j.retries,a.country_code,a.name AS agent_name,a.public_ip
+                   FROM agent_tasks q JOIN probe_jobs j ON j.id=q.job_id
+                   JOIN agents a ON a.id=q.agent_id
+                   WHERE q.status IN ('queued','running')"""
+            ).fetchall()
+            for task in stale:
+                if task["status"] == "queued":
+                    elapsed_from = task["created_at"]
+                    task_timeout = 120
+                else:
+                    elapsed_from = task["started_at"]
+                    task_timeout = task["timeout"] * (task["retries"] + 1) + 60
+                if datetime.now(timezone.utc) - datetime.fromisoformat(elapsed_from) < timedelta(seconds=task_timeout):
+                    continue
+                error = "Agent did not claim the task." if task["status"] == "queued" else "Agent did not complete the probe."
+                connection.execute(
+                    "UPDATE agent_tasks SET status='failed',finished_at=?,error=? WHERE id=?",
+                    (now, error, task["id"]),
+                )
+                connection.execute(
+                    """INSERT INTO probe_results(job_id,target_id,agent_id,country_code,agent_name,
+                       public_ip,timestamp,status,classification,error)
+                       VALUES(?,?,?,?,?,?,?,'error','agent_error',?)""",
+                    (task["job_id"], task["target_id"], task["agent_id"], task["country_code"],
+                     task["agent_name"], task["public_ip"], now, error),
+                )
+                job = connection.execute(
+                    "SELECT * FROM probe_jobs WHERE id=?", (task["job_id"],)
+                ).fetchone()
+                ids = json.loads(job["agent_ids"])
+                next_index = job["current_index"] + 1
+                if not job["paused"] and next_index < len(ids):
+                    sequence = connection.execute(
+                        "SELECT COALESCE(MAX(sequence),0)+1 FROM agent_tasks WHERE job_id=?",
+                        (job["id"],),
+                    ).fetchone()[0]
+                    queue_task(connection, job, ids[next_index], sequence)
+                    connection.execute(
+                        "UPDATE probe_jobs SET current_index=? WHERE id=?", (next_index, job["id"])
+                    )
+                else:
+                    run_status = "scheduled" if job["schedule_interval"] and not job["paused"] else (
+                        "paused" if job["paused"] else "failed"
+                    )
+                    next_run = (
+                        (datetime.now(timezone.utc) + timedelta(seconds=job["schedule_interval"])).isoformat()
+                        if run_status == "scheduled" else None
+                    )
+                    connection.execute(
+                        """UPDATE probe_jobs SET status=?,ended_at=?,next_run_at=?,last_failure_at=?,
+                           error=? WHERE id=?""",
+                        (run_status, now, next_run, now, error, job["id"]),
+                    )
+
     def scheduler_loop():
         while True:
             try:
-                with db.connect() as connection:
-                    now = utcnow()
-                    due = connection.execute(
-                        """SELECT id FROM probe_jobs WHERE schedule_interval IS NOT NULL
-                           AND paused=0 AND status='scheduled' AND next_run_at<=? ORDER BY next_run_at""",
-                        (now,),
-                    ).fetchall()
-                    for row in due:
-                        begin_job(connection, row["id"])
-                    stale = connection.execute(
-                        """SELECT q.*,j.target_id,j.agent_ids,j.current_index,j.schedule_interval,j.paused,
-                                  j.timeout,j.retries,
-                                  a.country_code,a.name AS agent_name,a.public_ip,t.url
-                           FROM agent_tasks q JOIN probe_jobs j ON j.id=q.job_id
-                           JOIN agents a ON a.id=q.agent_id JOIN targets t ON t.id=j.target_id
-                           WHERE q.status='running'""",
-                    ).fetchall()
-                    for task in stale:
-                        task_timeout = task["timeout"] * (task["retries"] + 1) + 60
-                        if datetime.now(timezone.utc) - datetime.fromisoformat(task["started_at"]) < timedelta(seconds=task_timeout):
-                            continue
-                        connection.execute(
-                            "UPDATE agent_tasks SET status='failed',finished_at=?,error='Agent task timed out' WHERE id=?",
-                            (now, task["id"]),
-                        )
-                        connection.execute(
-                            """INSERT INTO probe_results(job_id,target_id,agent_id,country_code,agent_name,
-                               public_ip,timestamp,status,classification,error)
-                               VALUES(?,?,?,?,?,?,?,'error','agent_error','Agent did not complete the probe.')""",
-                            (task["job_id"], task["target_id"], task["agent_id"], task["country_code"],
-                             task["agent_name"], task["public_ip"], now),
-                        )
-                        job = connection.execute("SELECT * FROM probe_jobs WHERE id=?", (task["job_id"],)).fetchone()
-                        ids = json.loads(job["agent_ids"])
-                        next_index = job["current_index"] + 1
-                        if not job["paused"] and next_index < len(ids):
-                            sequence = connection.execute(
-                                "SELECT COALESCE(MAX(sequence),0)+1 FROM agent_tasks WHERE job_id=?",
-                                (job["id"],),
-                            ).fetchone()[0]
-                            queue_task(connection, job, ids[next_index], sequence)
-                            connection.execute(
-                                "UPDATE probe_jobs SET current_index=? WHERE id=?", (next_index, job["id"])
-                            )
-                        else:
-                            connection.execute(
-                                "UPDATE probe_jobs SET status='failed',ended_at=?,last_failure_at=?,error='Agent task timed out' WHERE id=?",
-                                (now, now, job["id"]),
-                            )
+                scheduler_tick()
             except Exception:
                 app.logger.exception("Scheduler iteration failed")
             time.sleep(2)
 
+    app.extensions["monitor_scheduler_tick"] = scheduler_tick
     if app.config["START_SCHEDULER"]:
         threading.Thread(target=scheduler_loop, daemon=True, name="monitor-scheduler").start()
     return app

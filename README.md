@@ -23,10 +23,10 @@ python -m venv .venv
 pip install -r requirements.txt
 export MONITOR_DATABASE="$PWD/instance/monitor.db"
 export DASHBOARD_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-python app.py
+gunicorn --workers 1 --threads 8 --bind 127.0.0.1:5000 app:app
 ```
 
-Open `http://127.0.0.1:5000` and enter the `DASHBOARD_TOKEN` in the dashboard token field. The server binds to localhost by default. For remote use, deploy behind HTTPS and an authenticated reverse proxy, set a strong dashboard token, and configure `DASHBOARD_HOST` only when the network exposure is controlled. SQLite files contain monitoring data and should have restrictive filesystem permissions and backups.
+Open `http://127.0.0.1:5000` and enter the `DASHBOARD_TOKEN` in the dashboard token field. The production command uses one Gunicorn worker because the scheduler is in-process; the thread count handles dashboard requests and agents. For remote use, deploy behind HTTPS and an authenticated reverse proxy, set a strong dashboard token, and configure the bind address only when network exposure is controlled. SQLite files contain monitoring data and should have restrictive filesystem permissions and backups. `python app.py` is a localhost-only development server.
 
 Set `MONITOR_DATABASE` to move the SQLite database. The schema separates targets, countries, agents, jobs, results, redirects, response headers, alerts, audit events, and agent tasks to ease a future PostgreSQL migration. This first version is intended to run as one dashboard process; SQLite and the in-process scheduler are not a multi-worker/HA scheduler.
 

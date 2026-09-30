@@ -100,6 +100,7 @@ class DashboardPersistenceTests(unittest.TestCase):
         self.db = self.app.extensions["monitor_database"]
         self.dns_patcher = patch("monitoring.probe.socket.getaddrinfo", return_value=PUBLIC_DNS)
         self.dns_patcher.start()
+        self.assertEqual(self.client.get("/").status_code, 200)
 
     def tearDown(self):
         self.dns_patcher.stop()
@@ -191,7 +192,28 @@ class DashboardPersistenceTests(unittest.TestCase):
             self.assertEqual(row["schedule_interval"], 300)
             self.assertIsNotNone(row["next_run_at"])
 
-    def test_agent_failure_is_recorded_and_next_agent_is_queued(self):
+        task = self.client.get(
+            f"/api/agent/{agent['agent']['id']}/tasks/next",
+            headers={"Authorization": "Bearer " + agent["token"]},
+        ).json
+        self.client.post(
+            f"/api/agent/{agent['agent']['id']}/tasks/{task['task_id']}/result",
+            headers={"Authorization": "Bearer " + agent["token"]},
+            json={"classification": "reachable", "http_status": 200},
+        )
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE probe_jobs SET next_run_at='2000-01-01T00:00:00+00:00' WHERE id=?",
+                (result.json["id"],),
+            )
+        self.app.extensions["monitor_scheduler_tick"]()
+        next_task = self.client.get(
+            f"/api/agent/{agent['agent']['id']}/tasks/next",
+            headers={"Authorization": "Bearer " + agent["token"]},
+        )
+        self.assertEqual(next_task.json["job_id"], result.json["id"])
+
+    def test_offline_agent_failure_is_recorded_and_next_agent_is_queued(self):
         target_id = self.add_target()
         first = self.add_agent("France VPS", "FR")
         second = self.add_agent("Japan VPS", "JP")
@@ -199,22 +221,30 @@ class DashboardPersistenceTests(unittest.TestCase):
             "target_id": target_id,
             "agent_ids": [first["agent"]["id"], second["agent"]["id"]],
         }).json
-        task = self.client.get(
-            f"/api/agent/{first['agent']['id']}/tasks/next",
-            headers={"Authorization": "Bearer " + first["token"]},
-        ).json
-        saved = self.client.post(
-            f"/api/agent/{first['agent']['id']}/tasks/{task['task_id']}/result",
-            headers={"Authorization": "Bearer " + first["token"]},
-            json={"classification": "timeout", "error": "Timed out"},
-        )
-        self.assertEqual(saved.status_code, 200)
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE agent_tasks SET created_at='2000-01-01T00:00:00+00:00' WHERE job_id=?",
+                (job["id"],),
+            )
+        self.app.extensions["monitor_scheduler_tick"]()
         next_task = self.client.get(
             f"/api/agent/{second['agent']['id']}/tasks/next",
             headers={"Authorization": "Bearer " + second["token"]},
         )
         self.assertEqual(next_task.json["job_id"], job["id"])
-        self.assertEqual(self.client.get(f"/api/results?target_id={target_id}").json[0]["classification"], "timeout")
+        self.assertEqual(self.client.get(f"/api/results?target_id={target_id}").json[0]["classification"], "agent_error")
+
+    def test_dashboard_api_requires_configured_token(self):
+        protected = create_app({
+            "TESTING": True,
+            "DATABASE": os.path.join(self.directory.name, "protected.sqlite"),
+            "START_SCHEDULER": False,
+            "DASHBOARD_TOKEN": "unit-test-token",
+        }).test_client()
+        self.assertEqual(protected.get("/api/targets").status_code, 401)
+        self.assertEqual(protected.get(
+            "/api/targets", headers={"X-Dashboard-Token": "unit-test-token"}
+        ).status_code, 200)
 
 
 if __name__ == "__main__":

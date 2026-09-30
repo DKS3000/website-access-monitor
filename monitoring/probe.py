@@ -50,7 +50,9 @@ def validate_public_url(url):
         try:
             addresses = {
                 ipaddress.ip_address(item[4][0])
-                for item in socket.getaddrinfo(hostname, port or (443 if parsed.scheme == "https" else 80))
+                for item in socket.getaddrinfo(
+                    hostname, port or (443 if parsed.scheme.lower() == "https" else 80)
+                )
             }
         except (OSError, ValueError) as exc:
             raise URLValidationError("The target hostname could not be resolved.") from exc
@@ -87,6 +89,7 @@ def _tls_info(response):
 def _request_chain(url, timeout, proxy_url):
     redirects = []
     current_url = url
+    first_tls = None
     for _ in range(11):
         current_url = validate_public_url(current_url)
         with requests.Session() as session:
@@ -102,6 +105,8 @@ def _request_chain(url, timeout, proxy_url):
             ) as response:
                 location = response.headers.get("Location")
                 if response.status_code in {301, 302, 303, 307, 308} and location:
+                    if first_tls is None and urlsplit(current_url).scheme.lower() == "https":
+                        first_tls = _tls_info(response)
                     redirects.append(
                         {"url": current_url, "status": response.status_code, "location": location}
                     )
@@ -123,7 +128,11 @@ def _request_chain(url, timeout, proxy_url):
                     "status": "success" if classification == "reachable" else "error",
                     "classification": classification,
                     "final_url": current_url,
-                    "tls": _tls_info(response) if urlsplit(current_url).scheme == "https" else None,
+                    "tls": (
+                        _tls_info(response) or first_tls
+                        if urlsplit(current_url).scheme.lower() == "https"
+                        else first_tls
+                    ),
                     "redirects": redirects,
                     "redirect_count": len(redirects),
                     "headers": {
