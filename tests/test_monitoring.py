@@ -7,6 +7,7 @@ import requests
 
 from app import create_app
 from monitoring.probe import URLValidationError, probe_url, validate_public_url
+from agent.probe_agent import VPNError, ensure_vpn_connected
 
 
 PUBLIC_DNS = [(None, None, None, None, ("93.184.216.34", 443))]
@@ -89,6 +90,44 @@ class ProbeTests(unittest.TestCase):
     @patch("monitoring.probe.requests.Session.get", side_effect=requests.exceptions.Timeout("slow"))
     def test_classifies_timeout(self, _get, _dns):
         self.assertEqual(probe_url("https://example.com/", timeout=1)["classification"], "timeout")
+
+
+def cli_result(stdout="", returncode=0):
+    result = MagicMock()
+    result.stdout = stdout
+    result.returncode = returncode
+    return result
+
+
+class VPNAgentTests(unittest.TestCase):
+    """Confirms the VPN route only ever targets the operator-configured country - never
+    an alternate country/server search to get around an access-denied result."""
+
+    @patch("agent.probe_agent._run")
+    def test_nordvpn_already_connected_skips_reconnect(self, run):
+        run.return_value = cli_result("Status: Connected\nCountry: France\n")
+        ensure_vpn_connected("nordvpn", "France")
+        run.assert_called_once()  # only the status check; no connect attempt was issued
+
+    @patch("agent.probe_agent._run")
+    def test_nordvpn_connects_and_confirms(self, run):
+        run.side_effect = [
+            cli_result("Status: Disconnected\n"),
+            cli_result(""),  # connect call
+            cli_result("Status: Connected\nCountry: Germany\n"),
+        ]
+        ensure_vpn_connected("nordvpn", "Germany", deadline_seconds=5)
+        self.assertEqual(run.call_count, 3)
+
+    @patch("agent.probe_agent._run")
+    def test_nordvpn_raises_when_confirmation_never_arrives(self, run):
+        run.return_value = cli_result("Status: Disconnected\n")
+        with self.assertRaises(VPNError):
+            ensure_vpn_connected("nordvpn", "Germany", deadline_seconds=0)
+
+    def test_unsupported_provider_rejected(self):
+        with self.assertRaises(VPNError):
+            ensure_vpn_connected("supersecretvpn", "France")
 
 
 class DashboardPersistenceTests(unittest.TestCase):
@@ -245,6 +284,46 @@ class DashboardPersistenceTests(unittest.TestCase):
         self.assertEqual(protected.get(
             "/api/targets", headers={"X-Dashboard-Token": "unit-test-token"}
         ).status_code, 200)
+
+    def test_vpn_route_requires_supported_provider(self):
+        response = self.client.post("/api/agents", json={
+            "name": "VPN agent", "country_code": "FR", "route_type": "vpn",
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("vpn_provider", response.json["error"])
+
+    def test_vpn_route_created_and_task_carries_provider(self):
+        agent = self.client.post("/api/agents", json={
+            "name": "VPN agent", "country_code": "FR", "route_type": "vpn", "vpn_provider": "nordvpn",
+        }).json
+        self.assertEqual(agent["agent"]["route_type"], "vpn")
+        self.assertEqual(agent["agent"]["vpn_provider"], "nordvpn")
+        target_id = self.add_target()
+        self.client.post("/api/jobs", json={
+            "target_id": target_id, "agent_ids": [agent["agent"]["id"]],
+        })
+        task = self.client.get(
+            f"/api/agent/{agent['agent']['id']}/tasks/next",
+            headers={"Authorization": "Bearer " + agent["token"]},
+        ).json
+        self.assertEqual(task["vpn_provider"], "nordvpn")
+        self.assertEqual(task["country_code"], "FR")
+
+    def test_editing_agent_switches_country_and_route_without_new_token(self):
+        created = self.add_agent("Roaming VPS", "FR")
+        agent_id = created["agent"]["id"]
+        response = self.client.patch(f"/api/agents/{agent_id}", json={
+            "country_code": "DE", "route_type": "vpn", "vpn_provider": "mullvad",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["country_code"], "DE")
+        self.assertEqual(response.json["route_type"], "vpn")
+        self.assertEqual(response.json["vpn_provider"], "mullvad")
+        # The original enrollment token still authenticates; no re-enrollment is needed.
+        self.assertEqual(self.client.get(
+            f"/api/agent/{agent_id}/tasks/next",
+            headers={"Authorization": "Bearer " + created["token"]},
+        ).status_code, 204)
 
 
 if __name__ == "__main__":

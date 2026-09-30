@@ -4,14 +4,14 @@ An operator-managed dashboard for checking the ordinary HTTP(S) reachability of 
 
 ## Current capabilities
 
-- Manage public HTTP(S) targets and country-labelled probe agents.
+- Manage public HTTP(S) targets and country-labelled probe agents, routed directly, through an HTTP(S) proxy, or through a pre-configured VPN client (NordVPN/Mullvad).
 - Create one-shot or recurring jobs (5, 15, 30 minutes, hourly, daily).
 - Probe selected agents sequentially and keep results in SQLite.
 - Record status/classification, duration, DNS answers, TLS certificate details when available, redirect chain, selected response headers, response size, known egress IP and timestamp.
 - Compare route history, see 403 counts and latency history, inspect evidence, and open the original public URL in a normal browser.
 - Authenticate agent-to-dashboard requests with one-time enrollment tokens; optionally protect dashboard APIs with a dashboard token.
 
-Countries and egress IPs are operator-provided labels/configuration, not geolocation assertions. To compare locations, deploy an agent on a VPS in each location and supply its known public IP if desired. `direct` probes use the VPS's normal egress. `proxy` probes use the administrator-configured HTTP(S) proxy URL. The current agent protocol is provider-neutral; it does not create VPN connections, manage WireGuard/OpenWrt/SSH tunnels, or verify the VPS's physical location.
+Countries and egress IPs are operator-provided labels/configuration, not geolocation assertions. To compare locations, deploy an agent on a VPS in each location, or a single host running a VPN client, and supply its known public IP if desired. `direct` probes use the host's normal egress. `proxy` probes use the administrator-configured HTTP(S) proxy URL. `vpn` probes rely on a VPN client (NordVPN or Mullvad) the operator has already installed and logged in on that host, switched only to the single country configured for that agent — the agent does not manage WireGuard/OpenWrt/SSH tunnels itself, search alternate countries or servers, or verify the host's physical location.
 
 ## Run the dashboard
 
@@ -32,7 +32,7 @@ Set `MONITOR_DATABASE` to move the SQLite database. The schema separates targets
 
 ## Enroll a VPS agent
 
-In the dashboard, add an agent with a name, country, and direct or proxy route. An enrollment token appears once. On the VPS, install this repository and its Python requirements, then run:
+In the dashboard, add an agent with a name, country, and a direct, proxy, or VPN route. An enrollment token appears once. On the VPS, install this repository and its Python requirements, then run:
 
 ```bash
 export PROBE_AGENT_TOKEN='paste-the-one-time-token'
@@ -43,6 +43,16 @@ python agent/probe_agent.py --central-url https://monitor.example.net --agent-id
 Use a service manager (for example systemd) to keep the agent running. Agent connections to a remote dashboard require HTTPS. The agent polls for one task, probes only the supplied target URL, submits structured evidence, and continues polling. The dashboard stores only a SHA-256 token hash; agents must be enabled in the dashboard. A proxy URL is configured centrally and passed to the selected agent for that agent's probes. Do not configure a proxy you do not administer or have permission to use.
 
 For a local development agent, use `--central-url http://127.0.0.1:5000`. If a public egress IP is not supplied, the result leaves it blank rather than contacting an IP-echo service.
+
+### VPN route (NordVPN / Mullvad)
+
+Instead of maintaining a separate VPS per country, an agent can use a pre-configured, already-logged-in NordVPN or Mullvad client on its host. Choose "Pre-configured VPN client" as the route when adding the agent, pick the VPN provider, and set the agent's country to the location to monitor from. On the agent's host:
+
+- Install and authenticate the client yourself ahead of time (`nordvpn login` or `mullvad account login`); the app never stores or transmits VPN account credentials.
+- The agent, before each probe, confirms via `nordvpn status` / `mullvad status` that the client is already connected to the assigned country and issues `nordvpn connect <country>` / `mullvad relay set location <code>` + `mullvad connect` only if it is not. It never tries other countries or servers to get around a 403 — it always targets the single country you configured for that agent.
+- To monitor from a different country, edit the agent in the dashboard and change its country (and/or VPN provider); no re-enrollment or new token is required. The agent picks up the new assignment on its next queued task.
+- If the client cannot confirm the connection within about 45 seconds (not installed, not logged in, or an invalid location), the task is recorded with the `vpn_error` classification and the probe is not attempted, so a result is never misattributed to the wrong vantage point.
+
 
 ## Dashboard workflow
 

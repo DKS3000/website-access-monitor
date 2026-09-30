@@ -88,12 +88,19 @@ function renderTargets(targets) {
   if (enabled.some(t => String(t.id) === oldHistory)) historySelect.value = oldHistory;
 }
 
+function routeLabel(a) {
+  if (a.route_type === "vpn") return `vpn · ${escapeHtml(a.vpn_provider || "?")} → ${escapeHtml(a.country_code)}`;
+  if (a.route_type === "proxy") return "proxy";
+  return "direct";
+}
+
 function renderAgents(agents) {
   const selected = new Set([...document.querySelectorAll("#agentChoices input:checked")].map(input => input.value));
   document.querySelector("#agents").innerHTML = agents.map(a => `
     <div class="item"><div><strong>${escapeHtml(a.name)}</strong> · ${escapeHtml(a.country)} (${escapeHtml(a.country_code)})<br>
-    <small>${escapeHtml(a.route_type)} · ${escapeHtml(a.public_ip || "public IP not configured")} · ${escapeHtml(a.status)}${a.last_heartbeat ? ` · heartbeat ${escapeHtml(a.last_heartbeat)}` : ""}</small></div>
-    <button data-action="toggle-agent" data-id="${a.id}" data-enabled="${a.enabled ? 0 : 1}">${a.enabled ? "Disable" : "Enable"}</button></div>`).join("") || '<p class="muted">Enroll and start an agent on each VPS/vantage point.</p>';
+    <small>${routeLabel(a)} · ${escapeHtml(a.public_ip || "public IP not configured")} · ${escapeHtml(a.status)}${a.last_heartbeat ? ` · heartbeat ${escapeHtml(a.last_heartbeat)}` : ""}</small></div>
+    <span class="target-actions"><button data-action="edit-agent" data-id="${a.id}">Edit</button>
+    <button data-action="toggle-agent" data-id="${a.id}" data-enabled="${a.enabled ? 0 : 1}">${a.enabled ? "Disable" : "Enable"}</button></span></div>`).join("") || '<p class="muted">Enroll and start an agent on each VPS/vantage point.</p>';
   document.querySelector("#agentChoices").innerHTML = agents.filter(a => a.enabled).map(a =>
     `<label><input type="checkbox" value="${a.id}" ${selected.has(String(a.id)) ? "checked" : ""}> ${escapeHtml(a.country)} · ${escapeHtml(a.name)}</label>`
   ).join("") || '<span class="muted">Add an agent before running probes.</span>';
@@ -217,8 +224,17 @@ document.querySelector("#targetForm").addEventListener("submit", async event => 
   } catch (error) { showError(error); }
 });
 
+function toggleRouteFields(routeValue, proxyInput, vpnSelect) {
+  proxyInput.required = routeValue === "proxy";
+  proxyInput.classList.toggle("hidden", routeValue !== "proxy");
+  vpnSelect.classList.toggle("hidden", routeValue !== "vpn");
+}
+
 document.querySelector("#agentRoute").addEventListener("change", event => {
-  document.querySelector("#agentProxy").required = event.target.value === "proxy";
+  toggleRouteFields(event.target.value, document.querySelector("#agentProxy"), document.querySelector("#agentVpnProvider"));
+});
+document.querySelector("#editAgentRoute").addEventListener("change", event => {
+  toggleRouteFields(event.target.value, document.querySelector("#editAgentProxy"), document.querySelector("#editAgentVpnProvider"));
 });
 document.querySelector("#agentForm").addEventListener("submit", async event => {
   event.preventDefault();
@@ -228,6 +244,7 @@ document.querySelector("#agentForm").addEventListener("submit", async event => {
       country_code: document.querySelector("#agentCountry").value,
       route_type: document.querySelector("#agentRoute").value,
       proxy_url: document.querySelector("#agentProxy").value,
+      vpn_provider: document.querySelector("#agentVpnProvider").value,
       public_ip: document.querySelector("#agentIp").value
     })});
     const enrollment = document.querySelector("#enrollment");
@@ -236,6 +253,23 @@ document.querySelector("#agentForm").addEventListener("submit", async event => {
     event.target.reset(); await refresh();
   } catch (error) { showError(error); }
 });
+
+document.querySelector("#editAgentForm").addEventListener("submit", async event => {
+  event.preventDefault();
+  const id = document.querySelector("#editAgentId").value;
+  try {
+    await api(`/api/agents/${id}`, {method: "PATCH", body: JSON.stringify({
+      name: document.querySelector("#editAgentName").value,
+      country_code: document.querySelector("#editAgentCountry").value,
+      route_type: document.querySelector("#editAgentRoute").value,
+      proxy_url: document.querySelector("#editAgentProxy").value,
+      vpn_provider: document.querySelector("#editAgentVpnProvider").value
+    })});
+    document.querySelector("#editAgentDialog").close();
+    await refresh();
+  } catch (error) { showError(error); }
+});
+document.querySelector("#closeEditAgent").addEventListener("click", () => document.querySelector("#editAgentDialog").close());
 
 document.querySelector("#jobForm").addEventListener("submit", async event => {
   event.preventDefault();
@@ -268,6 +302,19 @@ document.body.addEventListener("click", async event => {
       if (window.confirm("Delete this target? Targets with saved history must be disabled instead.")) await api(`/api/targets/${id}`, {method: "DELETE"});
     } else if (action === "toggle-agent") {
       await api(`/api/agents/${id}`, {method: "PATCH", body: JSON.stringify({enabled: button.dataset.enabled === "1"})});
+    } else if (action === "edit-agent") {
+      const agent = lastAgents.find(a => String(a.id) === id);
+      if (!agent) return;
+      document.querySelector("#editAgentId").value = agent.id;
+      document.querySelector("#editAgentName").value = agent.name;
+      document.querySelector("#editAgentCountry").innerHTML = document.querySelector("#agentCountry").innerHTML;
+      document.querySelector("#editAgentCountry").value = agent.country_code;
+      document.querySelector("#editAgentRoute").value = agent.route_type;
+      document.querySelector("#editAgentProxy").value = agent.proxy_url || "";
+      if (agent.vpn_provider) document.querySelector("#editAgentVpnProvider").value = agent.vpn_provider;
+      toggleRouteFields(agent.route_type, document.querySelector("#editAgentProxy"), document.querySelector("#editAgentVpnProvider"));
+      document.querySelector("#editAgentDialog").showModal();
+      return;
     } else if (action === "pause-job" || action === "resume-job" || action === "retry-job") {
       const suffix = action.replace("-job", "");
       await api(`/api/jobs/${id}/${suffix}`, {method: "POST", body: "{}"});
@@ -279,5 +326,6 @@ document.body.addEventListener("click", async event => {
 document.querySelector("#historyTarget").addEventListener("change", () => refreshResults().catch(showError));
 document.querySelector("#closeDetails").addEventListener("click", () => document.querySelector("#details").close());
 window.addEventListener("resize", () => refreshResults().catch(() => {}));
+toggleRouteFields(document.querySelector("#agentRoute").value, document.querySelector("#agentProxy"), document.querySelector("#agentVpnProvider"));
 refresh();
 setInterval(refresh, 5000);

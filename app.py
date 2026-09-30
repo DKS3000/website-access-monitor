@@ -19,6 +19,8 @@ from monitoring.probe import URLValidationError, validate_public_url
 
 
 SCHEDULES = {None, 300, 900, 1800, 3600, 86400}
+VPN_PROVIDERS = {"nordvpn", "mullvad"}
+ROUTE_TYPES = {"direct", "proxy", "vpn"}
 
 
 def create_app(test_config=None):
@@ -123,7 +125,7 @@ def create_app(test_config=None):
         with db.connect() as connection:
             rows = connection.execute(
                 """SELECT a.id,a.name,a.country_code,c.name AS country,a.enabled,a.public_ip,
-                          a.route_type,a.status,a.last_heartbeat,a.created_at
+                          a.route_type,a.proxy_url,a.vpn_provider,a.status,a.last_heartbeat,a.created_at
                    FROM agents a JOIN countries c ON c.code=a.country_code ORDER BY c.name,a.name"""
             ).fetchall()
             agents = []
@@ -136,15 +138,10 @@ def create_app(test_config=None):
                 agents.append(item)
             return jsonify(agents)
 
-    @app.post("/api/agents")
-    def add_agent():
-        data = request.get_json(silent=True) or {}
-        name = str(data.get("name", "")).strip()[:100]
-        country = str(data.get("country_code", "")).upper()
-        route_type = data.get("route_type", "direct")
-        proxy_url = data.get("proxy_url")
-        if not name or route_type not in {"direct", "proxy"}:
-            return jsonify({"error": "Agent name and a direct/proxy route type are required."}), 400
+    def validate_route(route_type, proxy_url, vpn_provider):
+        """Validate route_type/proxy_url/vpn_provider; returns (proxy_url, vpn_provider) to store or raises ValueError."""
+        if route_type not in ROUTE_TYPES:
+            raise ValueError("Route type must be direct, proxy, or vpn.")
         if route_type == "proxy":
             try:
                 parsed_proxy = urlsplit(proxy_url)
@@ -158,9 +155,28 @@ def create_app(test_config=None):
             except (TypeError, ValueError):
                 valid_proxy = False
             if not valid_proxy:
-                return jsonify({"error": "Proxy routes require an HTTP or HTTPS proxy URL."}), 400
+                raise ValueError("Proxy routes require an HTTP or HTTPS proxy URL.")
             if "@" in proxy_url.split("://", 1)[-1]:
-                return jsonify({"error": "Credentials in proxy URLs are not supported; configure a trusted proxy without embedded credentials."}), 400
+                raise ValueError("Credentials in proxy URLs are not supported; configure a trusted proxy without embedded credentials.")
+            return proxy_url, None
+        if route_type == "vpn":
+            if vpn_provider not in VPN_PROVIDERS:
+                raise ValueError("VPN routes require a supported vpn_provider (nordvpn or mullvad) already installed and logged in on the agent's host.")
+            return None, vpn_provider
+        return None, None
+
+    @app.post("/api/agents")
+    def add_agent():
+        data = request.get_json(silent=True) or {}
+        name = str(data.get("name", "")).strip()[:100]
+        country = str(data.get("country_code", "")).upper()
+        route_type = data.get("route_type", "direct")
+        if not name:
+            return jsonify({"error": "Agent name is required."}), 400
+        try:
+            proxy_url, vpn_provider = validate_route(route_type, data.get("proxy_url"), data.get("vpn_provider"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         public_ip = str(data.get("public_ip", "")).strip()
         if public_ip:
             try:
@@ -173,11 +189,10 @@ def create_app(test_config=None):
                 return jsonify({"error": "Select a supported country."}), 400
             token = secrets.token_urlsafe(32)
             cursor = connection.execute(
-                """INSERT INTO agents(name,country_code,token_hash,public_ip,route_type,proxy_url,created_at)
-                   VALUES(?,?,?,?,?,?,?)""",
+                """INSERT INTO agents(name,country_code,token_hash,public_ip,route_type,proxy_url,vpn_provider,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
                 (name, country, hashlib.sha256(token.encode()).hexdigest(),
-                 public_ip[:64] or None,
-                 route_type, proxy_url if route_type == "proxy" else None, utcnow()),
+                 public_ip[:64] or None, route_type, proxy_url, vpn_provider, utcnow()),
             )
             agent_id = cursor.lastrowid
             connection.execute(
@@ -185,7 +200,7 @@ def create_app(test_config=None):
                 ("agent.created", db.json({"agent_id": agent_id}), utcnow()),
             )
             agent = connection.execute(
-                """SELECT a.id,a.name,a.country_code,c.name AS country,a.route_type,a.public_ip
+                """SELECT a.id,a.name,a.country_code,c.name AS country,a.route_type,a.vpn_provider,a.public_ip
                    FROM agents a JOIN countries c ON c.code=a.country_code WHERE a.id=?""",
                 (agent_id,),
             ).fetchone()
@@ -199,8 +214,41 @@ def create_app(test_config=None):
             if not row:
                 return jsonify({"error": "Agent not found."}), 404
             enabled = int(bool(data.get("enabled", row["enabled"])))
-            connection.execute("UPDATE agents SET enabled=? WHERE id=?", (enabled, agent_id))
-        return jsonify({"id": agent_id, "enabled": bool(enabled)})
+            name = str(data.get("name", row["name"])).strip()[:100] or row["name"]
+            country = str(data.get("country_code", row["country_code"])).upper()
+            route_type = data.get("route_type", row["route_type"])
+            try:
+                proxy_url, vpn_provider = validate_route(
+                    route_type,
+                    data.get("proxy_url", row["proxy_url"]),
+                    data.get("vpn_provider", row["vpn_provider"]),
+                )
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+            if country != row["country_code"] and not connection.execute(
+                "SELECT 1 FROM countries WHERE code=?", (country,)
+            ).fetchone():
+                return jsonify({"error": "Select a supported country."}), 400
+            connection.execute(
+                """UPDATE agents SET enabled=?,name=?,country_code=?,route_type=?,proxy_url=?,vpn_provider=?
+                   WHERE id=?""",
+                (enabled, name, country, route_type, proxy_url, vpn_provider, agent_id),
+            )
+            if country != row["country_code"] or route_type != row["route_type"]:
+                connection.execute(
+                    "INSERT INTO audit_events(event_type,details_json,created_at) VALUES(?,?,?)",
+                    ("agent.route_updated", db.json({
+                        "agent_id": agent_id, "country_code": country, "route_type": route_type,
+                    }), utcnow()),
+                )
+            updated = connection.execute(
+                """SELECT a.id,a.name,a.country_code,c.name AS country,a.enabled,a.route_type,
+                          a.proxy_url,a.vpn_provider,a.public_ip
+                   FROM agents a JOIN countries c ON c.code=a.country_code WHERE a.id=?""",
+                (agent_id,),
+            ).fetchone()
+        return jsonify(dict(updated))
+
 
     @app.get("/api/jobs")
     def list_jobs():
@@ -394,7 +442,8 @@ def create_app(test_config=None):
             )
             task = connection.execute(
                 """SELECT q.id AS task_id,q.job_id,j.target_id,j.timeout,j.retries,t.url,
-                          a.name AS agent_name,a.country_code,a.public_ip,a.proxy_url
+                          a.name AS agent_name,a.country_code,a.public_ip,a.route_type,
+                          a.proxy_url,a.vpn_provider
                    FROM agent_tasks q JOIN probe_jobs j ON j.id=q.job_id
                    JOIN targets t ON t.id=j.target_id JOIN agents a ON a.id=q.agent_id
                    WHERE q.agent_id=? AND q.status='queued' AND j.paused=0
@@ -428,7 +477,7 @@ def create_app(test_config=None):
             classification = str(data.get("classification", "network_error"))
             if classification not in {
                 "reachable", "access_denied", "http_error", "dns_error",
-                "tls_error", "timeout", "network_error", "unsafe_redirect",
+                "tls_error", "timeout", "network_error", "unsafe_redirect", "vpn_error",
             }:
                 classification = "network_error"
             status = "success" if classification == "reachable" else "error"

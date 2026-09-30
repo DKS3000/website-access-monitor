@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS targets (
 CREATE TABLE IF NOT EXISTS agents (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, country_code TEXT NOT NULL REFERENCES countries(code),
   enabled INTEGER NOT NULL DEFAULT 1, token_hash TEXT NOT NULL, public_ip TEXT,
-  route_type TEXT NOT NULL DEFAULT 'direct', proxy_url TEXT,
+  route_type TEXT NOT NULL DEFAULT 'direct', proxy_url TEXT, vpn_provider TEXT,
   status TEXT NOT NULL DEFAULT 'offline', last_heartbeat TEXT, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS probe_jobs (
@@ -95,12 +95,20 @@ class Database:
     def initialize(self):
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate(connection)
             connection.executemany(
                 "INSERT OR IGNORE INTO countries(code, name) VALUES (?, ?)",
                 [("IN", "India"), ("US", "United States"), ("GB", "United Kingdom"),
                  ("DE", "Germany"), ("SG", "Singapore"), ("CA", "Canada"),
                  ("FR", "France"), ("JP", "Japan"), ("AU", "Australia")],
             )
+
+    @staticmethod
+    def _migrate(connection):
+        """Add columns introduced after a database file's initial creation."""
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(agents)")}
+        if "vpn_provider" not in columns:
+            connection.execute("ALTER TABLE agents ADD COLUMN vpn_provider TEXT")
 
     @staticmethod
     def row(row):

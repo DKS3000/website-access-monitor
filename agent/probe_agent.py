@@ -3,11 +3,95 @@
 
 import argparse
 import os
+import subprocess
 import time
 
 import requests
 
 from monitoring.probe import probe_url
+
+VPN_CONNECT_TIMEOUT = 45
+VPN_POLL_INTERVAL = 2
+
+
+class VPNError(Exception):
+    """Raised when the local VPN client cannot be confirmed as connected to the requested country."""
+
+
+def _run(command, timeout=20):
+    return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+
+
+def nordvpn_current_country():
+    """Return the country NordVPN's CLI reports itself connected to, or None."""
+    try:
+        result = _run(["nordvpn", "status"])
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if "Status: Connected" not in result.stdout:
+        return None
+    for line in result.stdout.splitlines():
+        if line.strip().lower().startswith("country:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def mullvad_current_country():
+    """Return the country Mullvad's CLI reports itself connected to, or None."""
+    try:
+        result = _run(["mullvad", "status"])
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = result.stdout.splitlines()
+    if not lines or "Connected" not in lines[0]:
+        return None
+    for line in lines:
+        if "in" in line and "," in line:
+            return line.rsplit(",", 1)[-1].strip().rstrip(".")
+    return None
+
+
+VPN_BACKENDS = {
+    "nordvpn": {
+        "current_country": nordvpn_current_country,
+        "connect": lambda country: _run(["nordvpn", "connect", country], timeout=VPN_CONNECT_TIMEOUT),
+    },
+    "mullvad": {
+        "current_country": mullvad_current_country,
+        "connect": lambda country: (
+            _run(["mullvad", "relay", "set", "location", country.lower()], timeout=VPN_CONNECT_TIMEOUT),
+            _run(["mullvad", "connect"], timeout=VPN_CONNECT_TIMEOUT),
+        ),
+    },
+}
+
+
+def ensure_vpn_connected(provider, country, deadline_seconds=VPN_CONNECT_TIMEOUT):
+    """Use the operator's already-installed/logged-in VPN client to reach the assigned country.
+
+    This selects exactly the operator-configured country for this agent; it never tries
+    alternate countries or servers to work around an access-denied result.
+    """
+    backend = VPN_BACKENDS.get(provider)
+    if not backend:
+        raise VPNError(f"Unsupported vpn_provider '{provider}'.")
+    current = backend["current_country"]()
+    if current and current.lower() == country.lower():
+        return
+    try:
+        backend["connect"](country)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise VPNError(f"Could not run the {provider} CLI: {exc}") from exc
+    deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < deadline:
+        current = backend["current_country"]()
+        if current and current.lower() == country.lower():
+            return
+        time.sleep(VPN_POLL_INTERVAL)
+    raise VPNError(
+        f"{provider} did not confirm a connection to {country} within {deadline_seconds}s; "
+        "check that the client is installed, logged in, and that country is a valid server location."
+    )
 
 
 def run_agent(central_url, agent_id, token, public_ip=None, poll_interval=3):
@@ -32,6 +116,19 @@ def run_agent(central_url, agent_id, token, public_ip=None, poll_interval=3):
                 continue
             response.raise_for_status()
             task = response.json()
+            vpn_provider = task.get("vpn_provider")
+            if vpn_provider:
+                try:
+                    ensure_vpn_connected(vpn_provider, task["country_code"])
+                except VPNError as exc:
+                    session.post(
+                        f"{central_url}/api/agent/{agent_id}/tasks/{task['task_id']}/result",
+                        json={"classification": "vpn_error", "error": str(exc)},
+                        headers=headers,
+                        timeout=20,
+                    ).raise_for_status()
+                    print(f"Task {task['task_id']}: vpn_error {exc}")
+                    continue
             result = probe_url(
                 task["url"],
                 timeout=task["timeout"],
@@ -54,6 +151,7 @@ def run_agent(central_url, agent_id, token, public_ip=None, poll_interval=3):
         except (KeyError, ValueError) as exc:
             print(f"Invalid task received: {exc}")
             time.sleep(max(poll_interval, 5))
+
 
 
 def main():
