@@ -74,8 +74,8 @@ echo ""
 
 # Step 7: Create necessary directories
 echo "[7/10] Creating directories..."
-mkdir -p reports logs
-echo "✓ Directories created: reports, logs"
+mkdir -p reports logs static templates
+echo "✓ Directories created: reports, logs, static, templates"
 echo ""
 
 # Step 8: Verify installation
@@ -104,13 +104,23 @@ echo ""
 # Step 10: Create helper scripts
 echo "[10/10] Creating helper scripts..."
 
+# Dashboard script
+cat > start_dashboard.sh << 'EOF'
+#!/bin/bash
+cd "$(dirname "$0")"
+source venv/bin/activate
+echo "Dashboard: http://localhost:${PORT:-5000}"
+python app.py
+EOF
+chmod +x start_dashboard.sh
+
 # Quick test script
 cat > quick_test.sh << 'EOF'
 #!/bin/bash
 cd "$(dirname "$0")"
 source venv/bin/activate
-echo "Testing direct connection to dgft.co.in..."
-python monitor.py --target https://dgft.co.in --verbose
+echo "Testing direct connection to www.dgft.gov.in..."
+python monitor.py --target "${TARGET_URL:-https://www.dgft.gov.in}" --verbose
 EOF
 chmod +x quick_test.sh
 
@@ -121,7 +131,7 @@ cd "$(dirname "$0")"
 source venv/bin/activate
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 echo "Generating JSON report..."
-python monitor.py --target https://dgft.co.in --config routes.json --output reports/report_${TIMESTAMP}.json
+python monitor.py --target "${TARGET_URL:-https://www.dgft.gov.in}" --config routes.json --output reports/report_${TIMESTAMP}.json
 echo "Report saved to: reports/report_${TIMESTAMP}.json"
 EOF
 chmod +x run_json_report.sh
@@ -133,7 +143,7 @@ cd "$(dirname "$0")"
 source venv/bin/activate
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 echo "Generating HTML report..."
-python monitor.py --target https://dgft.co.in --config routes.json --html reports/report_${TIMESTAMP}.html
+python monitor.py --target "${TARGET_URL:-https://www.dgft.gov.in}" --config routes.json --html reports/report_${TIMESTAMP}.html
 echo "Report saved to: reports/report_${TIMESTAMP}.html"
 echo "Open it in browser: firefox reports/report_${TIMESTAMP}.html"
 EOF
@@ -163,13 +173,16 @@ echo "   ./run_html_report.sh"
 echo ""
 echo "4. Manual command:"
 echo "   source venv/bin/activate"
-echo "   python monitor.py --target https://dgft.co.in --verbose"
+echo "   python monitor.py --target https://www.dgft.gov.in --verbose"
 echo ""
 echo "5. View configuration:"
 echo "   cat routes.json"
 echo ""
 echo "6. Edit configuration:"
 echo "   nano routes.json"
+echo ""
+echo "7. Start the dashboard:"
+echo "   ./start_dashboard.sh   (then open http://localhost:5000)"
 echo ""
 echo "Next Steps:"
 echo "- Configure your VPN/proxy routes in routes.json"

@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Website Access Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+:root{--bg:#f4f6fa;--card:#fff;--text:#1c2430;--muted:#6b7686;--border:#dde2ea;--up:#16a34a;--down:#dc2626;--accent:#2563eb}
+[data-theme=dark]{--bg:#0f141b;--card:#18202b;--text:#e6ebf2;--muted:#8d99a9;--border:#2a3545;--accent:#60a5fa}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,Arial,sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:var(--card);border-bottom:1px solid var(--border);flex-wrap:wrap;gap:8px}
+h1{font-size:1.2rem;margin:0}h2{font-size:1rem;margin:0 0 10px}
+main{max-width:1200px;margin:0 auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:16px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
+label{font-size:.75rem;color:var(--muted);display:block;margin-bottom:3px}
+input,select,button{padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text);font-size:.9rem}
+input[type=text]{min-width:300px}
+button{cursor:pointer}button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+button.danger{background:var(--down);color:#fff;border-color:var(--down)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px}
+.stat .k{font-size:.7rem;text-transform:uppercase;color:var(--muted)}
+.stat .v{font-size:1.05rem;font-weight:600;word-break:break-all;margin-top:4px}
+.up{color:var(--up)}.down{color:var(--down)}
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th,td{padding:6px 8px;border-bottom:1px solid var(--border);text-align:left}
+.scroll{overflow-x:auto;max-height:340px;overflow-y:auto}
+#msg{margin-top:8px;font-size:.85rem;color:var(--muted)}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
+</style>
+</head>
+<body>
+<header>
+  <h1>🌐 Website Access Monitor</h1>
+  <div class="row">
+    <label><input type="checkbox" id="notify"> Notify / sound on success</label>
+    <button id="theme">Dark / Light</button>
+  </div>
+</header>
+<main>
+<section class="card">
+  <div class="row">
+    <div><label>Target URL</label><input type="text" id="target" value="{{ default_target }}"></div>
+    <div><label>Route / location</label><select id="route"><option value="direct">Direct</option></select></div>
+    <div><label>Retry interval (s)</label><input type="number" id="interval" value="2" min="0.5" step="0.5" style="width:90px"></div>
+    <div><label>Max attempts</label><input type="number" id="maxAttempts" value="30" min="1" style="width:90px"></div>
+    <div><label>Schedule every N min (0=off)</label><input type="number" id="schedule" value="0" min="0" style="width:90px"></div>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <button class="primary" id="start">▶ Start (retry until success)</button>
+    <button class="danger" id="stop">■ Stop</button>
+    <button id="once">Test once</button>
+    <button id="saveCfg">Save settings</button>
+    <button id="compare">Compare all routes</button>
+    <button id="vpnOff">Disconnect VPN</button>
+  </div>
+  <div id="msg"></div>
+</section>
+
+<section class="grid" id="cards"></section>
+
+<div class="two" style="margin-top:16px">
+  <section class="card"><h2>Diagnostics (last test)</h2><div id="diag" class="grid"></div></section>
+  <section class="card"><h2>Response time <span id="uptime" style="float:right;font-weight:400"></span></h2><canvas id="chart" height="140"></canvas></section>
+</div>
+
+<section class="card"><h2>Compare routes</h2><div class="scroll"><table><thead><tr><th>Route</th><th>Status</th><th>HTTP</th><th>Total ms</th><th>DNS ms</th><th>TCP ms</th><th>TLS ms</th><th>TTFB ms</th><th>Error</th></tr></thead><tbody id="cmp"><tr><td colspan="9">Run "Compare all routes".</td></tr></tbody></table></div></section>
+
+<section class="card">
+  <h2>History (last 100)</h2>
+  <div class="row" style="margin-bottom:8px">
+    <div><label>Filter</label><select id="filter"><option value="all">All</option><option value="success">Success</option><option value="error">Failure</option></select></div>
+    <a href="/api/export/json"><button>Export JSON</button></a>
+    <a href="/api/export/csv"><button>Export CSV</button></a>
+  </div>
+  <div class="scroll"><table><thead><tr><th>Time</th><th>Route</th><th>Status</th><th>HTTP</th><th>Latency ms</th><th>Error</th></tr></thead><tbody id="hist"></tbody></table></div>
+</section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'—':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let history=[],chart=null,wasSuccess=false,cfgLoaded=false;
+async function api(path,opts){const r=await fetch(path,opts);let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw new Error(j.error||j.status||r.statusText);return j}
+const post=(p,b)=>api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+function say(t){$('msg').textContent=t}
+function formBody(){return{target_url:$('target').value,route:$('route').value,interval:+$('interval').value,max_attempts:+$('maxAttempts').value,schedule_minutes:+$('schedule').value}}
+function stat(k,v,cls){return `<div class="stat"><div class="k">${k}</div><div class="v ${cls||''}">${esc(v)}</div></div>`}
+function render(s){
+  const r=(s.current_result&&s.current_result.results||[])[0]||{};
+  const up=r.status==='success';
+  const ssl=r.ssl?(r.ssl.valid===null?'unknown':(r.ssl.valid?'Valid':'Invalid')+(r.ssl.expires?' · expires '+r.ssl.expires.slice(0,10):'')):'—';
+  const ip=s.public_ip||{};
+  $('cards').innerHTML=
+    stat('State',r.status?(up?'UP':'DOWN'):'—',r.status?(up?'up':'down'):'')+
+    stat('HTTP status',r.http_status)+stat('Response time',r.response_time_ms!=null?r.response_time_ms+' ms':null)+
+    stat('Final URL',r.final_url)+stat('Server',r.server)+stat('SSL certificate',ssl)+
+    stat('Public IP',ip.ip?ip.ip+' ('+(ip.country||'?')+')':null)+
+    stat('VPN',s.vpn_available?(s.vpn_connected?'Connected'+(s.vpn_country?' · '+s.vpn_country:''):'Disconnected'):'VPN not available')+
+    stat('Monitoring',(s.running?'Running':'Idle')+' · attempt '+s.attempts+'/'+s.max_attempts);
+  const d=r.diagnostics||{};
+  $('diag').innerHTML=
+    stat('DNS',d.dns_ms!=null?d.dns_ms+' ms':null)+stat('Resolved IPs',(d.dns_ips||[]).join(', ')||null)+
+    stat('TCP connect',d.tcp_ms!=null?d.tcp_ms+' ms':null)+stat('TLS handshake',d.tls_ms!=null?d.tls_ms+' ms':null)+
+    stat('Time to first byte',d.ttfb_ms!=null?d.ttfb_ms+' ms':null)+stat('Total',d.total_ms!=null?d.total_ms+' ms':null)+
+    stat('Error reason',r.error||(r.status?'None':null),r.error?'down':'');
+  if(up&&s.success&&!wasSuccess)notify();
+  wasSuccess=!!s.success;
+}
+function notify(){
+  if(!$('notify').checked)return;
+  try{const c=new (window.AudioContext||window.webkitAudioContext)(),o=c.createOscillator();o.connect(c.destination);o.start();o.stop(c.currentTime+0.4)}catch(e){}
+  if('Notification' in window&&Notification.permission==='granted')new Notification('Site reachable',{body:$('target').value});
+}
+function renderHistory(){
+  const f=$('filter').value;
+  const rows=history.filter(h=>f==='all'||(f==='success')===(h.status==='success')).slice().reverse();
+  $('hist').innerHTML=rows.map(h=>`<tr><td>${esc(h.timestamp&&h.timestamp.replace('T',' ').slice(0,19))}</td><td>${esc(h.country)}</td><td class="${h.status==='success'?'up':'down'}">${esc(h.status)}</td><td>${esc(h.http_status)}</td><td>${esc(h.response_time_ms)}</td><td>${esc(h.error)}</td></tr>`).join('')||'<tr><td colspan="6">No results yet.</td></tr>';
+  const ok=history.filter(h=>h.status==='success').length;
+  $('uptime').textContent=history.length?'Uptime '+(100*ok/history.length).toFixed(1)+'%':'';
+  const labels=history.map(h=>(h.timestamp||'').slice(11,19)),data=history.map(h=>h.response_time_ms);
+  if(window.Chart){
+    if(!chart)chart=new Chart($('chart'),{type:'line',data:{labels,datasets:[{label:'ms',data,borderColor:'#2563eb',spanGaps:true,tension:.2}]},options:{animation:false}});
+    else{chart.data.labels=labels;chart.data.datasets[0].data=data;chart.update()}
+  }
+}
+async function refresh(){
+  try{
+    const s=await api('/api/status');
+    if(!cfgLoaded){cfgLoaded=true;$('target').value=s.target_url;$('interval').value=s.interval;$('maxAttempts').value=s.max_attempts;$('schedule').value=s.schedule_minutes;if([...$('route').options].some(o=>o.value===s.route))$('route').value=s.route}
+    render(s);history=await api('/api/history');renderHistory();
+  }catch(e){say('Error: '+e.message)}
+}
+async function loadRoutes(){
+  const j=await api('/api/routes');
+  $('route').innerHTML=j.routes.map(r=>`<option value="${esc(r.id)}">${esc(r.name)}${r.type==='vpn'?' (VPN)':''}</option>`).join('');
+  if(!j.vpn_available)say('VPN not available — direct and proxy routes still work.');
+}
+async function act(fn,ok){try{say('Working…');const r=await fn();say(ok||'Done');await refresh();return r}catch(e){say('Error: '+e.message)}}
+$('start').onclick=()=>{if($('notify').checked&&'Notification' in window)Notification.requestPermission();act(()=>post('/api/config',formBody()).then(()=>post('/api/start',formBody())),'Started')};
+$('stop').onclick=()=>act(()=>post('/api/stop'),'Stopped');
+$('once').onclick=()=>act(()=>post('/api/test-once',formBody()),'Test complete');
+$('saveCfg').onclick=()=>act(()=>post('/api/config',formBody()),'Settings saved');
+$('vpnOff').onclick=()=>act(()=>post('/api/vpn/disconnect'),'VPN disconnected');
+$('compare').onclick=()=>act(async()=>{
+  const j=await post('/api/compare',{target_url:$('target').value});
+  $('cmp').innerHTML=j.results.map(r=>{const d=r.diagnostics||{};return `<tr><td>${esc(r.country)}</td><td class="${r.status==='success'?'up':'down'}">${esc(r.status)}</td><td>${esc(r.http_status)}</td><td>${esc(d.total_ms)}</td><td>${esc(d.dns_ms)}</td><td>${esc(d.tcp_ms)}</td><td>${esc(d.tls_ms)}</td><td>${esc(d.ttfb_ms)}</td><td>${esc(r.error)}</td></tr>`}).join('');
+},'Comparison complete');
+$('filter').onchange=renderHistory;
+$('theme').onclick=()=>{const h=document.documentElement;const t=h.dataset.theme==='dark'?'light':'dark';h.dataset.theme=t;localStorage.setItem('theme',t)};
+document.documentElement.dataset.theme=localStorage.getItem('theme')||'light';
+loadRoutes().then(refresh);setInterval(refresh,4000);
+</script>
+</body>
+</html>

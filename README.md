@@ -10,7 +10,11 @@ Monitor and test website accessibility from multiple network locations, VPN endp
 - ✅ JSON output for integration and automation
 - ✅ HTML report generation
 - ✅ Content fingerprinting and comparison
-- ✅ Scheduled monitoring (optional)
+- ✅ Scheduled monitoring with history persisted to `logs/history.json`
+- ✅ Web dashboard: live status cards, per-test diagnostics (DNS, TCP, TLS, TTFB, total), response-time chart, uptime %, history filter, compare-all-routes view, JSON/CSV export, dark/light theme, browser notification/sound when the site becomes reachable
+- ✅ "Retry until success" mode with configurable interval and max attempts
+- ✅ Works without NordVPN (shows "VPN not available"; direct and proxy routes still work)
+- ✅ Editable target URL (dashboard and `--target`), default `https://www.dgft.gov.in`
 
 ## Use Cases
 
@@ -22,36 +26,49 @@ Monitor and test website accessibility from multiple network locations, VPN endp
 
 ## Installation
 
+Ubuntu:
+
 ```bash
+sudo apt update && sudo apt install -y git python3 python3-venv python3-pip
 git clone https://github.com/DKS3000/website-access-monitor.git
 cd website-access-monitor
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
+python app.py
 ```
+
+Then open the dashboard at <http://localhost:5000> (set `PORT=8000` to change the port).
+The default target is `https://www.dgft.gov.in`; override it with the `TARGET_URL`
+environment variable, the dashboard input, or `--target` on the CLI.
+`./install_ubuntu.sh` automates these steps and creates `start_dashboard.sh`.
+
+The dashboard schedules tests in-process, so run a single server process.
 
 ## Quick Start
 
 ### 1. Test a single website from direct connection
 
 ```bash
-python monitor.py --target https://dgft.co.in
+python monitor.py --target https://www.dgft.gov.in
 ```
 
 ### 2. Test from multiple routes (using config file)
 
 ```bash
-python monitor.py --target https://dgft.co.in --config routes.json
+python monitor.py --target https://www.dgft.gov.in --config routes.json
 ```
 
 ### 3. Generate JSON report
 
 ```bash
-python monitor.py --target https://dgft.co.in --config routes.json --output report.json
+python monitor.py --target https://www.dgft.gov.in --config routes.json --output report.json
 ```
 
 ### 4. Generate HTML dashboard report
 
 ```bash
-python monitor.py --target https://dgft.co.in --config routes.json --html report.html
+python monitor.py --target https://www.dgft.gov.in --config routes.json --html report.html
 ```
 
 ## Configuration
@@ -117,7 +134,7 @@ python monitor.py --target https://dgft.co.in --config routes.json --html report
 
 ```json
 {
-  "target": "https://dgft.co.in",
+  "target": "https://www.dgft.gov.in",
   "timestamp": "2026-09-26T10:30:00Z",
   "results": [
     {
@@ -125,7 +142,7 @@ python monitor.py --target https://dgft.co.in --config routes.json --html report
       "status": "success",
       "http_status": 200,
       "response_time_ms": 523,
-      "final_url": "https://dgft.co.in/",
+      "final_url": "https://www.dgft.gov.in/",
       "server": "nginx",
       "content_hash": "abc123def456",
       "headers": {
@@ -141,7 +158,7 @@ python monitor.py --target https://dgft.co.in --config routes.json --html report
 ## Quick command
 
 ```bash
-python monitor.py --target https://dgft.co.in --config routes.json --output report.json
+python monitor.py --target https://www.dgft.gov.in --config routes.json --output report.json
 ```
 
 ## License
