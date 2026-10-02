@@ -7,12 +7,14 @@ from typing import Any, Dict, List
 
 import requests
 
+from config import DEFAULT_TARGET_URL, validate_target_url
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Monitor website accessibility from multiple routes"
     )
-    parser.add_argument("--target", required=True, help="Target URL to test")
+    parser.add_argument("--target", default=DEFAULT_TARGET_URL, help="Target URL to test (default: %(default)s)")
     parser.add_argument("--config", default="routes.json", help="Routes JSON config")
     parser.add_argument("--output", help="Write JSON report to file")
     parser.add_argument("--html", help="Write HTML report to file")
@@ -204,6 +206,12 @@ def generate_html(report: Dict[str, Any]) -> str:
 
 def main():
     args = parse_args()
+
+    try:
+        args.target = validate_target_url(args.target)
+    except ValueError as exc:
+        print(f"Invalid target: {exc}", file=sys.stderr)
+        return 2
 
     try:
         routes = load_routes(args.config)

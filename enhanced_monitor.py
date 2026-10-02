@@ -17,6 +17,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from enum import Enum
 
+from config import DEFAULT_TARGET_URL, validate_target_url
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry as URLRetry
@@ -451,7 +452,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Enhanced Website Access Monitor v2.0"
     )
-    parser.add_argument("--target", required=True, help="Target URL to test")
+    parser.add_argument("--target", default=DEFAULT_TARGET_URL, help="Target URL to test (default: %(default)s)")
     parser.add_argument("--config", default="routes.json", help="Routes config file")
     parser.add_argument("--output", help="Write JSON report")
     parser.add_argument("--html", help="Write HTML report")
@@ -470,6 +471,12 @@ def main():
     """Main entry point."""
     args = parse_args()
     
+    try:
+        args.target = validate_target_url(args.target)
+    except ValueError as exc:
+        print(f"✗ Invalid target: {exc}", file=sys.stderr)
+        return 2
+
     try:
         monitor = EnhancedMonitor(args.config, args.verbose)
         
